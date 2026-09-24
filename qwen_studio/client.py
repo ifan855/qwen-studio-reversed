@@ -105,6 +105,40 @@ def make_http_session(impersonate: Optional[str] = "chrome",
     return sess
 
 
+def host_of(url: str) -> str:
+    """``https://chat.qwen.ai/api/v2`` -> ``chat.qwen.ai`` (for error text)."""
+    return url.split("//", 1)[-1].split("/", 1)[0] or url
+
+
+# First component of the modules transport failures come from, e.g.
+# ``curl_cffi.requests.errors.RequestsError`` -> ``curl_cffi``.
+TRANSPORT_MODULES = ("curl_cffi", "requests", "urllib3", "socket", "ssl")
+
+
+def as_transport_error(e: BaseException, target: str) -> Optional[exc.TransportError]:
+    """Rewrite a low-level HTTP/socket failure as a typed short error.
+
+    ``curl_cffi``, ``requests`` and socket failures (DNS, TLS reset, blocked
+    egress) arrive as foreign exception types carrying a wall of transport
+    detail - e.g. ``curl: (35) BoringSSL SSL_connect: Connection closed
+    abruptly`` - which tells the caller neither which host failed nor what to
+    do. The rewritten error names the host and keeps the original text in
+    ``details``; the OpenAI-compatible proxy maps it to a 502
+    ``upstream_unavailable`` instead of a generic 500.
+
+    Returns ``None`` when *e* is not a transport failure, so callers can
+    re-raise it unchanged.
+    """
+    if isinstance(e, exc.QwenStudioError):
+        return None
+    module = type(e).__module__.split(".", 1)[0]
+    if not (isinstance(e, OSError) or module in TRANSPORT_MODULES):
+        return None
+    text = " ".join(str(e).split())
+    return exc.TransportError(f"cannot reach {target}: {text[:200]}",
+                              target=target, details=text)
+
+
 def iter_lines_compat(resp) -> Iterator[str]:
     """Decode ``iter_lines`` output for requests *and* curl_cffi."""
     for ln in resp.iter_lines():
@@ -313,13 +347,26 @@ class QwenStudio:
         return jar
 
     # -------------------------------------------------------------- token cycle
+    def _call(self, fn: Any, target: str) -> Any:
+        """Run one raw HTTP call, typing transport failures (see
+        :func:`as_transport_error`) so callers never see a bare curl error."""
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - re-raised below
+            te = as_transport_error(e, target)
+            if te is None:
+                raise
+            raise te from e
+
     def signin(self) -> Dict[str, Any]:
         """Password sign-in -> 30-day session token."""
         if not (self.email and self._password):
             raise exc.AuthError("signin requires email and password")
         pw = hashlib.sha256(self._password.encode()).hexdigest()
-        r = self.http.post(f"{BASE}/auths/signin", json={"email": self.email, "password": pw},
-                           headers=self.headers(bearer=False), timeout=self.timeout)
+        r = self._call(lambda: self.http.post(
+            f"{BASE}/auths/signin", json={"email": self.email, "password": pw},
+            headers=self.headers(bearer=False), timeout=self.timeout),
+            host_of(BASE))
         d = self._json(r)
         if not d.get("success"):
             raise exc.AuthError("signin rejected", status=r.status_code, payload=d)
@@ -338,12 +385,13 @@ class QwenStudio:
         """
         if not self.session_token:
             raise exc.TokenExpiredError("no session token; cannot refresh")
-        r = self.http.get(
+        r = self._call(lambda: self.http.get(
             f"{AUTH_BASE}/auths/refresh",
             cookies={"token": self.session_token},
             headers=self.headers(bearer=False,
                                  **{"x-request-origin": "https://chat.qwen.ai"}),
-            timeout=self.timeout)
+            timeout=self.timeout),
+            host_of(AUTH_BASE))
         d = self._json(r)
         if not d.get("success"):
             data = (d.get("data") or {}) if isinstance(d.get("data"), dict) else {}
@@ -438,11 +486,11 @@ class QwenStudio:
         if bearer:
             self.ensure_access_token()
         self._paced_sleep()
-        r = self.http.request(
+        r = self._call(lambda: self.http.request(
             method, f"{BASE}{path}", params=params, json=json_body,
             headers=self.headers(bearer=bearer and bool(self.access_token), **hdr),
             cookies=self._cookies() if cookie_auth else None,
-            timeout=self.timeout)
+            timeout=self.timeout), host_of(BASE))
         self._check_punish(r.text[:2000])
         d = self._json(r)
         self._check_app_error(r, d)
@@ -473,13 +521,13 @@ class QwenStudio:
         """
         self.ensure_access_token()
         self._paced_sleep()
-        r = self.http.post(
+        r = self._call(lambda: self.http.post(
             f"{BASE}/chat/completions", params={"chat_id": chat_id},
             json=body,
             headers=self.headers(Accept="application/json",
                                  **{"x-accel-buffering": "no"}),
             cookies=self._cookies(),
-            stream=True, timeout=self.timeout)
+            stream=True, timeout=self.timeout), host_of(BASE))
         ct = r.headers.get("content-type", "")
         if "event-stream" not in ct:
             raw = self._read_body(r)[:2000]

@@ -383,9 +383,16 @@ class QwenBackend:
         return model
 
     def download(self, url: str) -> Tuple[bytes, str]:
-        r = self.q.http.get(url, timeout=60,
-                            headers={"User-Agent": self.q.headers(bearer=False)
-                                     ["User-Agent"]})
+        from .client import as_transport_error, host_of
+        try:
+            r = self.q.http.get(
+                url, timeout=60,
+                headers={"User-Agent": self.q.headers(bearer=False)["User-Agent"]})
+        except Exception as e:  # noqa: BLE001 - typed below
+            te = as_transport_error(e, host_of(url))
+            if te is None:
+                raise
+            raise te from e
         if r.status_code != 200:
             raise exc.APIError(f"attachment download failed: HTTP {r.status_code}",
                                status=r.status_code, details=url)

@@ -19,17 +19,35 @@ map to 503/429 so standard OpenAI SDK retry logic behaves.
 from __future__ import annotations
 
 import json
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 
 from . import exceptions as exc
 from .openai_api import OpenAICompatService
 
+SERVICE_NAME = "qwen-studio OpenAI-compatible proxy"
+
+#: What this process actually serves - quoted back to clients that probe
+#: other paths (browsers, WebSocket clients, health checkers).
+SUPPORTED_ENDPOINTS = ("GET /health", "GET /v1/models",
+                       "POST /v1/chat/completions", "POST /v1/files",
+                       "GET /v1/files", "GET /v1/files/{id}")
+
+#: Paths clients commonly open expecting a WebSocket (browsers, chat UIs,
+#: preview proxies). Documented so the answer is a clear message instead of
+#: a silent connection reset.
+WEBSOCKET_PATHS = ("/ws", "/websocket", "/socket.io", "/ws/socket.io")
+
 
 def error_object(message: str, type_: str = "api_error",
                  code: Optional[str] = None) -> Dict[str, Any]:
     return {"error": {"message": message, "type": type_, "code": code,
                       "param": None}}
+
+
+def _endpoint_list() -> str:
+    return ", ".join(SUPPORTED_ENDPOINTS)
 
 
 def map_exception(e: Exception) -> Tuple[int, Dict[str, Any]]:
@@ -45,6 +63,11 @@ def map_exception(e: Exception) -> Tuple[int, Dict[str, Any]]:
     if isinstance(e, exc.BadRequestError):
         return 400, error_object(str(e), "invalid_request_error",
                                  getattr(e, "code", None))
+    if isinstance(e, exc.TransportError):
+        # the machine could not reach the Qwen hosts at all (DNS, TLS reset,
+        # blocked egress). Not an internal bug: 502 + the host name.
+        return 502, error_object(str(e), "upstream_unavailable",
+                                 "upstream_unreachable")
     if isinstance(e, exc.AuthError):
         return 500, error_object(f"proxy authentication problem: {e}",
                                  "configuration_error", "auth")
@@ -121,6 +144,53 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(blob)
 
+    def send_error(self, code: int, message: Optional[str] = None,
+                   explain: Optional[str] = None) -> None:
+        """Answer protocol-level errors as JSON, not the HTML error page.
+
+        ``http.server``'s default is an HTML document ("Error response" /
+        "Error code: 400"); OpenAI clients parse JSON, so HTML turns a
+        clear protocol error into a confusing decoder failure.
+        """
+        try:
+            short = message or self.responses[code][0]
+        except (KeyError, IndexError):        # pragma: no cover - defensive
+            short = "error"
+        self.close_connection = True
+        try:
+            self._json_send(int(code), error_object(str(short),
+                                                    "invalid_request_error",
+                                                    f"http_{code}"))
+        except Exception:                     # noqa: BLE001 - headers/socket gone
+            pass
+
+    def _index(self) -> None:
+        """Human/browser-friendly description of what this service serves."""
+        return self._json_send(200, {
+            "service": SERVICE_NAME,
+            "endpoints": list(SUPPORTED_ENDPOINTS),
+            "note": ("This is an HTTP JSON+SSE API. WebSocket paths (for "
+                     "example /ws) are not part of it - if a tool is trying "
+                     "to open one, point it at its own backend instead."),
+        })
+
+    def _reject_path(self, path: str) -> None:
+        """Answer an unknown path - including WebSocket upgrade attempts."""
+        upgrade = (self.headers.get("Upgrade", "") or "").lower()
+        wants_ws = "websocket" in upgrade or path in WEBSOCKET_PATHS
+        if wants_ws:
+            self.close_connection = True
+            return self._json_send(501, error_object(
+                f"{path} is a WebSocket endpoint, and this proxy does not "
+                f"speak WebSockets - it serves the OpenAI HTTP API only "
+                f"({_endpoint_list()}). If something is trying to open a "
+                f"WebSocket here, it is not talking to this API; point it at "
+                f"its own backend.", "upgrade_required",
+                "websocket_unsupported"))
+        return self._json_send(404, error_object(
+            f"unknown path {path}; this proxy serves ({_endpoint_list()})",
+            "not_found", "unknown_path"))
+
     def _authorized(self) -> bool:
         if not self.api_key:
             return True
@@ -155,6 +225,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         if path == "/health":
             return self._json_send(200, {"ok": True,
                                          "service": "qwen-openai-proxy"})
+        if path in ("/", "/v1"):
+            return self._index()
+        if path in WEBSOCKET_PATHS and "websocket" in (
+                self.headers.get("Upgrade", "") or "").lower():
+            return self._reject_path(path)
         if not self._authorized():
             return self._json_send(401, error_object("invalid api key",
                                                      "auth_error"))
@@ -176,8 +251,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             status, payload = map_exception(e)
             return self._json_send(status, payload)
-        return self._json_send(404, error_object(f"unknown path {path}",
-                                                 "not_found"))
+        return self._reject_path(path)
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0].rstrip("/") or "/"
@@ -195,8 +269,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             status, payload = map_exception(e)
             return self._json_send(status, payload)
-        return self._json_send(404, error_object(f"unknown path {path}",
-                                                 "not_found"))
+        return self._reject_path(path)
 
     # ------------------------------------------------------------ handlers
     def _upload_file(self) -> None:
@@ -267,11 +340,34 @@ class OpenAIProxyServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    #: Client-side hangs-up, not server faults: browsers and chat UIs probing
+    #: WebSocket paths, preview/health probes that time out, tabs closed
+    #: mid-request, cancelled SSE streams.
+    DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError,
+                         ConnectionAbortedError, TimeoutError)
+
     def __init__(self, addr: Tuple[str, int], service: OpenAICompatService,
                  api_key: Optional[str] = None) -> None:
         self.service = service
         self.api_key = api_key
         super().__init__(addr, OpenAIHandler)
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        """Log disconnects in one line instead of dumping a traceback.
+
+        ``socketserver`` prints "Exception occurred during processing of
+        request from ..." plus a full traceback for anything that escapes a
+        handler - including a client that simply went away (a WebSocket
+        probe answered with "no upgrade", a browser that navigated off, an
+        aborted download). That output reads like a server crash and hides
+        the request's actual log line.
+        """
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(exc_type, self.DISCONNECT_ERRORS):
+            sys.stderr.write("[proxy] %s went away (%s) - connection closed\n"
+                             % (client_address[0], exc_type.__name__))
+            return
+        super().handle_error(request, client_address)
 
 
 def serve(client, *, host: str = "127.0.0.1", port: int = 8080,

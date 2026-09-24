@@ -94,12 +94,20 @@ class FileService:
         s2s = self._oss_string_to_sign("PUT", content_type, date, token, bucket, key)
         sig = base64.b64encode(hmac.new(sts["access_key_secret"].encode(),
                                         s2s.encode(), hashlib.sha1).digest()).decode()
-        r = self.client.http.put(
-            f"https://{host}/{key}", data=blob,
-            headers={"Date": date, "Content-Type": content_type,
-                     "x-oss-security-token": token,
-                     "Authorization": f"OSS {sts['access_key_id']}:{sig}"},
-            timeout=self.client.timeout)
+        from .client import as_transport_error
+        from . import exceptions as exc
+        try:
+            r = self.client.http.put(
+                f"https://{host}/{key}", data=blob,
+                headers={"Date": date, "Content-Type": content_type,
+                         "x-oss-security-token": token,
+                         "Authorization": f"OSS {sts['access_key_id']}:{sig}"},
+                timeout=self.client.timeout)
+        except Exception as e:  # noqa: BLE001 - typed below
+            te = as_transport_error(e, host)
+            if te is None:
+                raise
+            raise te from e
         if r.status_code not in (200, 201):
             from . import exceptions as exc
             raise exc.APIError(f"OSS upload failed: HTTP {r.status_code}",

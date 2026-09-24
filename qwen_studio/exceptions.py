@@ -139,5 +139,26 @@ class StreamInterruptedError(QwenStudioError):
     """The SSE stream ended abnormally (timeout, connection reset, bad frame)."""
 
 
+class TransportError(QwenStudioError):
+    """The HTTP transport failed before any API response arrived.
+
+    DNS failures, refused or reset TLS connections, timeouts and
+    environments that block egress to the Qwen hosts all surface here.
+    ``curl`` reports most of them as "Connection closed abruptly", which
+    says nothing about *which* connection or why - so the message names the
+    host that could not be reached and ``details`` keeps the original text.
+
+    Attributes:
+        target: the host the client was trying to reach (``chat.qwen.ai``).
+        details: the untouched transport error text.
+    """
+
+    def __init__(self, message: str, *, target: str = "",
+                 details: str = "") -> None:
+        super().__init__(message)
+        self.target = target
+        self.details = details
+
+
 class ToolExecutionError(QwenStudioError):
     """A locally registered tool callable raised an exception."""

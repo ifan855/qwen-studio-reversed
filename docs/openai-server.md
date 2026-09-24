@@ -50,9 +50,46 @@ decisive discriminator).
   via `{"type":"file","file":{"file_id":"file-..."}}`.
 - `GET /v1/files`, `GET /v1/files/{id}` - list/inspect in-memory uploads.
 - `GET /health`.
+- `GET /` (and `GET /v1`) - a JSON index of the above (handy when the port
+  is opened in a browser).
 
 Errors are OpenAI error objects; upstream states map to 429 (rate/quota)
-and 503 (anti-bot punish) so standard SDK retry logic behaves.
+and 503 (anti-bot punish) so standard SDK retry logic behaves. Every error
+response is JSON - including protocol-level ones (a malformed request line,
+an unsupported method), which `http.server` would otherwise answer with an
+HTML error page that OpenAI clients cannot parse.
+
+### Non-API paths and WebSocket probes
+
+The proxy speaks HTTP JSON+SSE only; it has no WebSocket endpoint. Browsers,
+chat UIs and preview/health probes nevertheless open `ws://…/ws` (and
+`/socket.io`, …) against whatever port they find. Those requests are answered
+with an explicit message instead of a bare rejection:
+
+```json
+{"error": {"message": "/ws is a WebSocket endpoint, and this proxy does not
+            speak WebSockets - it serves the OpenAI HTTP API only
+            (GET /health, GET /v1/models, POST /v1/chat/completions, …) …",
+           "type": "upgrade_required", "code": "websocket_unsupported"}}
+```
+
+Unknown HTTP paths get a 404 that lists the real endpoints. A client that
+simply goes away mid-request (a dropped WebSocket probe, a closed tab, a
+cancelled stream) is logged in one line - `… went away (ConnectionResetError)
+- connection closed` - rather than as a `socketserver` traceback that reads
+like a server crash. Real handler bugs still print in full.
+
+### When the machine cannot reach Qwen
+
+If DNS, TLS or egress to `chat.qwen.ai` / `auth.qwen.ai` fails (sandboxes and
+locked-down hosts commonly block it), curl reports it as *"Connection closed
+abruptly"*. Those failures are typed as `TransportError` and answered with
+`502 upstream_unavailable` naming the host, e.g. `cannot reach chat.qwen.ai:
+… Connection closed abruptly …` - instead of a generic 500 with a wall of
+transport text. The startup catalogue check reports the same and the server
+keeps running (the network may come back). If `serve` logs this for every
+request, the machine running it has no route to Qwen: run it where
+`chat.qwen.ai` is reachable.
 
 ## How the mapping works
 
