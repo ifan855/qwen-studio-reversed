@@ -337,7 +337,7 @@ class QwenStudio:
             raise exc.TokenExpiredError("no session token; cannot refresh")
         r = self.http.get(
             f"{AUTH_BASE}/auths/refresh",
-            cookies=self._cookies(),
+            cookies={"token": self.session_token},
             headers=self.headers(bearer=False,
                                  **{"x-request-origin": "https://chat.qwen.ai"}),
             timeout=self.timeout)
