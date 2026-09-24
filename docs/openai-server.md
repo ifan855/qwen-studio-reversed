@@ -37,7 +37,7 @@ decisive discriminator).
 | `--max-sessions` | 256 | LRU cap; evicted conversations are deleted upstream |
 | `--oneshot-ttl` | -1 | optional early cleanup for an idle *single-turn* conversation's chat + project; disabled by default so the same project/chat survives for the full session TTL; history is retained until the session expires |
 | `--replay` | `both` | unseen-history mode: `both`/`file`/`inline` |
-| `--thinking` | off | enable Qwen thinking -> `reasoning_content` deltas |
+| `--thinking` | off | enable Qwen thinking -> `reasoning_content` deltas; requests can override with `thinking` |
 | `--default-model` | first catalogue entry | used when the client's model id is unknown |
 | `--min-interval` | 4.0 | upstream request pacing (seconds) |
 
@@ -119,6 +119,14 @@ results) follows it. Verified live: a fabricated 3-turn history
 ("favourite colour teal, cat named Miso") was honoured exactly. If the file
 upload fails, the proxy falls back to inline-only automatically.
 
+### Thinking
+
+The OpenAI-compatible request may include a `thinking` field. `thinking: null`
+disables Qwen thinking for that request; any non-null value enables it. The
+proxy exposes Qwen's thinking summaries as OpenAI `reasoning_content` deltas and
+includes the complete `reasoning_content` in non-streaming responses. If the
+request omits `thinking`, the CLI/server-level thinking setting is used.
+
 ### Tools through MCP
 
 OpenAI `tools` function definitions are declared to Qwen as client-side
@@ -130,7 +138,9 @@ invokes one, the proxy replies with standard OpenAI
 `finish_reason:"tool_calls"`; your client executes the tool and posts the
 `role:"tool"` result back. The upstream conversation is also linked with the previous Qwen response
 node id on every native continuation, so new messages are appended to the
-same server-side tree rather than treated as edits. The upstream
+same server-side tree rather than treated as edits. OpenAI `role:"tool"`
+results are translated to Qwen's native `local_mcp` function-result envelope
+rather than being injected as ordinary prompt text. The upstream
 `role:"function"` continuation remains subject to the server gate described
 in docs/local-tools.md; for the OpenAI proxy, tool requests are exposed as
 standard `tool_calls` while the native `local_mcp` declaration stays attached

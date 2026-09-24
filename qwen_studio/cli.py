@@ -256,7 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="how unseen histories are replayed into a fresh "
                          "conversation (default: upload a history file AND "
                          "inline the transcript)")
-    ps.add_argument("--thinking", action="store_true",
+    ps.add_argument("--thinking", action="store_true", default=None,
                     help="enable Qwen thinking (exposed as "
                          "'reasoning_content' deltas)")
     ps.add_argument("--default-model",

@@ -628,6 +628,29 @@ INTERRUPTED_NOTE = ("(Note: your previous reply in this chat was cut off "
                     "and never reached the user - disregard it.)\n\n")
 
 
+def _local_mcp_tool_results(tail: List[Dict[str, Any]],
+                           context: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Translate OpenAI ``role:tool`` results to native Qwen ``local_mcp``."""
+    names: Dict[str, str] = {}
+    for view in list(context) + list(tail):
+        for call in view.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            if call.get("id"):
+                names[call["id"]] = fn.get("name") or "tool"
+    entries: List[Dict[str, str]] = []
+    for view in tail:
+        content = view.get("content")
+        if isinstance(content, list):
+            content = text_of(view)
+        name = names.get(view.get("tool_call_id"), "tool")
+        entries.append({name: str(content or "")})
+    return {TOOL_SERVER_NAME: entries}
+
+
+def _is_tool_result_tail(tail: List[Dict[str, Any]]) -> bool:
+    return bool(tail) and all(v.get("role") == "tool" for v in tail)
+
+
 # ------------------------------------------------------------------ backend
 class QwenBackend:
     """All upstream Qwen operations the proxy needs, behind one object.
@@ -754,26 +777,8 @@ class QwenBackend:
                             "input_schema": schema}
         return {TOOL_SERVER_NAME: bucket} if bucket else {}
 
-    def stream_turn(self, chat_id: str, model: str, prompt: str, *,
-                    files_entries: Optional[List[Dict[str, Any]]] = None,
-                    tools_decl: Optional[Dict[str, Any]] = None,
-                    thinking: bool = False,
-                    parent_id: Optional[str] = None) -> Generator[Dict[str, Any], None, None]:
-        """One user turn -> normalised upstream events:
-
-        ``{"type":"created"|"answer"|"thinking"|"tool_call"|"done", ...}``
-        """
-        fc = dict(DEFAULT_FEATURE_CONFIG)
-        if thinking:
-            fc.update(thinking_enabled=True, auto_thinking=True,
-                      thinking_mode="Enable")
-        if tools_decl:
-            fc["local_mcp"] = tools_decl
-        msg = ChatCompletion.user_message(prompt, model, feature_config=fc,
-                                          parent_id=parent_id,
-                                          files=files_entries or [])
-        body = ChatCompletion.build_body(chat_id, [msg], model,
-                                         parent_id=parent_id)
+    def _stream_body(self, body: Dict[str, Any], chat_id: str
+                     ) -> Generator[Dict[str, Any], None, None]:
         response_id = None
         for ev in self.q.stream_events(body, chat_id):
             if ev.type == "created":
@@ -801,12 +806,46 @@ class QwenBackend:
                 for e in entries:
                     if not isinstance(e, dict):
                         continue
-                    name = e.get("tool_name")
-                    if not name and isinstance(e, dict) and e:
-                        name = next(iter(e))
+                    name = e.get("tool_name") or (next(iter(e)) if e else None)
                     yield {"type": "tool_call", "name": name,
                            "arguments": e.get("params") or {}}
         yield {"type": "done", "response_id": response_id}
+
+    def stream_turn(self, chat_id: str, model: str, prompt: str, *,
+                    files_entries: Optional[List[Dict[str, Any]]] = None,
+                    tools_decl: Optional[Dict[str, Any]] = None,
+                    thinking: bool = False,
+                    parent_id: Optional[str] = None) -> Generator[Dict[str, Any], None, None]:
+        """One normal user turn using native MCP declarations when supplied."""
+        fc = dict(DEFAULT_FEATURE_CONFIG)
+        if thinking:
+            fc.update(thinking_enabled=True, auto_thinking=True, thinking_mode="Enable")
+        if tools_decl:
+            fc["local_mcp"] = tools_decl
+        msg = ChatCompletion.user_message(prompt, model, feature_config=fc,
+                                          parent_id=parent_id, files=files_entries or [])
+        body = ChatCompletion.build_body(chat_id, [msg], model, parent_id=parent_id)
+        yield from self._stream_body(body, chat_id)
+
+    def stream_tool_results(self, chat_id: str, model: str, response_id: str,
+                            results: Dict[str, Any], *, thinking: bool = False
+                            ) -> Generator[Dict[str, Any], None, None]:
+        """Feed executed tool results back through Qwen's native local-MCP path."""
+        fc = dict(DEFAULT_FEATURE_CONFIG)
+        if thinking:
+            fc.update(thinking_enabled=True, auto_thinking=True, thinking_mode="Enable")
+        content = json.dumps(results, ensure_ascii=False)
+        fn_msg = {
+            "fid": str(uuid.uuid4()), "parentId": response_id, "childrenIds": [],
+            "role": "function", "content": content, "files": [],
+            "timestamp": int(time.time()), "models": [model], "model": "",
+            "chat_type": "t2t", "feature_config": fc,
+            "extra": {"meta": {"subChatType": "t2t"}, "mcp_results": results},
+            "sub_chat_type": "t2t", "parent_id": response_id,
+        }
+        body = ChatCompletion.build_body(
+            chat_id, [fn_msg], model, parent_id=response_id)
+        yield from self._stream_body(body, chat_id)
 
 
 
@@ -900,7 +939,7 @@ class OpenAICompatService:
 
     def __init__(self, backend: QwenBackend, *, ttl: float = 3600.0,
                  max_sessions: int = 256, replay_mode: str = "both",
-                 thinking: bool = False, max_images: int = 10,
+                 thinking: Any = None, max_images: int = 10,
                  sweeper_interval: float = 15.0,
                  oneshot_ttl: Optional[float] = None,
                  max_cleanup_attempts: int = 5) -> None:
@@ -1104,6 +1143,11 @@ class OpenAICompatService:
         return "json", aggregate_chunks(out)
 
     # ------------------------------------------------------------- planning
+    def _resolve_thinking(self, body: Dict[str, Any]) -> bool:
+        """``thinking: null`` disables thinking; any non-null value enables it."""
+        value = body["thinking"] if "thinking" in body else self.thinking
+        return value is not None
+
     def _plan(self, body: Dict[str, Any]) -> Plan:
         messages = body.get("messages") or []
         if not isinstance(messages, list) or not messages:
@@ -1121,6 +1165,7 @@ class OpenAICompatService:
                  decision.mode,
                  f" [{sess.id[:8]} chat={sess.chat_id}]" if sess else "",
                  len(views), len(self.router))
+        request_thinking = self._resolve_thinking(body)
         tools_present = "tools" in body
         tools_decl = (self.backend.declare_tools(body.get("tools") or [])
                       if tools_present else {})
@@ -1134,14 +1179,18 @@ class OpenAICompatService:
             effective_tools = tools_decl if tools_present else sess.tools_decl
             if sess.dormant or sess.failures >= 2:
                 return self._plan_open(views, effective_tools, body, mode="revive",
-                                       session=sess, reuse_project=sess.project)
-            return self._plan_native(sess, views, decision, effective_tools, body)
+                                       session=sess, reuse_project=sess.project,
+                                       thinking=request_thinking)
+            return self._plan_native(sess, views, decision, effective_tools, body,
+                                     thinking=request_thinking)
         if decision.mode == "fork":
             assert sess is not None
             effective_tools = tools_decl if tools_present else sess.tools_decl
             return self._plan_open(views, effective_tools, body, mode="fork",
-                                   reuse_project=sess.project)
-        return self._plan_open(views, tools_decl, body, mode=decision.mode)
+                                   reuse_project=sess.project,
+                                   thinking=request_thinking)
+        return self._plan_open(views, tools_decl, body, mode=decision.mode,
+                               thinking=request_thinking)
 
 
     # ---------------------------------------------------------------- pieces
@@ -1251,7 +1300,7 @@ class OpenAICompatService:
     # ----------------------------------------------------------- plan modes
     def _plan_native(self, sess: Session, views: List[Dict[str, Any]],
                      decision: Decision, tools_decl: Dict[str, Any],
-                     body: Dict[str, Any]) -> Plan:
+                     body: Dict[str, Any], *, thinking: bool) -> Plan:
         """Continue a stored conversation in its own project + chat: only the
         messages the client added since our last reply go upstream."""
         tail = decision.tail
@@ -1263,14 +1312,22 @@ class OpenAICompatService:
             body.get("model") or sess.model,
             has_images=any(a.content_type.startswith("image/") for a in atts))
         entries = self._upload_entries(atts)
+        native_tool_results = (_local_mcp_tool_results(tail, sess.views)
+                               if _is_tool_result_tail(tail)
+                               and sess.upstream_parent_id else None)
         prompt = render_continuation(tail, sess.views)
         if sess.interrupted:
             prompt = INTERRUPTED_NOTE + prompt
         try:
-            events = _prime(self.backend.stream_turn(
-                sess.chat_id, model, prompt, files_entries=entries,
-                tools_decl=tools_decl, thinking=self.thinking,
-                parent_id=sess.upstream_parent_id))
+            if native_tool_results is not None:
+                events = _prime(self.backend.stream_tool_results(
+                    sess.chat_id, model, sess.upstream_parent_id,
+                    native_tool_results, thinking=thinking))
+            else:
+                events = _prime(self.backend.stream_turn(
+                    sess.chat_id, model, prompt, files_entries=entries,
+                    tools_decl=tools_decl, thinking=thinking,
+                    parent_id=sess.upstream_parent_id))
         except CHAT_BROKEN_ERRORS as e:
             # the chat itself rejected the turn (deleted, broken, gated):
             # carry the conversation over into a fresh chat, same project
@@ -1309,12 +1366,13 @@ class OpenAICompatService:
                 sess.failures += 1
 
         return Plan(mode="native", session=sess,
-                    gen=self._drive(events, model, commit, abort))
+                    gen=self._drive(events, model, commit, abort, thinking=thinking))
 
     def _plan_open(self, views: List[Dict[str, Any]],
                    tools_decl: Dict[str, Any], body: Dict[str, Any], *,
                    mode: str, session: Optional[Session] = None,
-                   reuse_project: Optional[UpstreamProject] = None) -> Plan:
+                   reuse_project: Optional[UpstreamProject] = None,
+                   thinking: bool = False) -> Plan:
         """Open a fresh upstream chat for ``views`` and answer its latest turn.
 
         ``new``     single user message -> plain first turn.
@@ -1364,7 +1422,7 @@ class OpenAICompatService:
             entries += self._upload_entries(atts)
             events = _prime(self.backend.stream_turn(
                 chat_id, model, prompt, files_entries=entries,
-                tools_decl=tools_decl, thinking=self.thinking))
+                tools_decl=tools_decl, thinking=thinking))
         except BaseException:
             if chat_id:
                 self._delete("chat", chat_id)
@@ -1398,13 +1456,13 @@ class OpenAICompatService:
             self._release_project(project)
 
         return Plan(mode=mode, session=sess,
-                    gen=self._drive(events, model, commit, abort))
+                    gen=self._drive(events, model, commit, abort, thinking=thinking))
 
     # ------------------------------------------------------------- draining
     def _drive(self, events: Iterator[Dict[str, Any]], model: str,
                on_commit: Callable[[Dict[str, Any], Dict[str, Any], Optional[str]], None],
-               on_abort: Callable[[Optional[BaseException]], None]
-               ) -> Generator[Dict[str, Any], None, None]:
+               on_abort: Callable[[Optional[BaseException]], None], *,
+               thinking: bool) -> Generator[Dict[str, Any], None, None]:
         """Consume upstream events, emit OpenAI chunk dicts, then commit.
 
         ``on_commit`` runs only once the whole reply has been handed to the
@@ -1431,7 +1489,7 @@ class OpenAICompatService:
                     first = False
                 elif ev["type"] == "thinking":
                     think.append(ev["text"])
-                    if self.thinking:
+                    if thinking:
                         yield _chunk(reply_id, created, model,
                                      {"reasoning_content": ev["text"]},
                                      first=first)
@@ -1462,7 +1520,7 @@ class OpenAICompatService:
         msg: Dict[str, Any] = {"role": "assistant",
                                "content": content if content else (
                                    None if calls else "")}
-        if think and self.thinking:
+        if think and thinking:
             msg["reasoning_content"] = "".join(think)
         if calls:
             msg["tool_calls"] = calls

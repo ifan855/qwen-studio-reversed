@@ -29,6 +29,8 @@ class StubBackend:
     def __init__(self, turns=None, models=None):
         self.turns = list(turns or [])          # one event-list per stream_turn
         self.stream_calls = []                  # (chat_id, model, prompt, files, tools, parent_id)
+        self.stream_tool_result_calls = []
+        self.thinking_calls = []
         self.created = []                       # (model, system)
         self.uploads = []                       # (filename, ct)
         self.cleaned = []                       # (chat_ids, project_id)
@@ -101,10 +103,18 @@ class StubBackend:
                     tools_decl=None, thinking=False, parent_id=None):
         self.stream_calls.append((chat_id, model, prompt, files_entries,
                                   tools_decl, parent_id))
+        self.thinking_calls.append(thinking)
         events = self.turns.pop(0) if self.turns else [
             {"type": "answer", "text": "stub"}]
         yield from events
         yield {"type": "done", "response_id": "resp-1"}
+
+    def stream_tool_results(self, chat_id, model, response_id, results, *, thinking=False):
+        self.stream_tool_result_calls.append((chat_id, model, response_id, results, thinking))
+        self.thinking_calls.append(thinking)
+        events = self.turns.pop(0) if self.turns else [{"type": "answer", "text": "tool-result answer"}]
+        yield from events
+        yield {"type": "done", "response_id": "resp-tool"}
 
 
 def make_service(backend, **kw):
@@ -395,6 +405,63 @@ def test_native_mcp_declaration_survives_follow_up_without_tools_field():
     assert be.stream_calls[1][5] == "up-1"
 
 
+def test_qwen_backend_builds_native_local_mcp_tool_result_message():
+    from types import SimpleNamespace
+    from qwen_studio.openai_api import QwenBackend
+
+    class Client:
+        def __init__(self):
+            self.body = None
+
+        def stream_events(self, body, chat_id):
+            self.body = body
+            yield SimpleNamespace(type="created", response_id="new-response")
+            yield SimpleNamespace(type="delta", status=None, phase="answer",
+                                  content="ok", extra={})
+
+    client = Client()
+    backend = QwenBackend(client)
+    events = list(backend.stream_tool_results(
+        "chat-1", "qwen3.7-plus", "tool-response",
+        {"openai_tools": [{"lookup": "RESULT-X"}]}))
+    message = client.body["messages"][0]
+    assert message["role"] == "function"
+    assert message["fid"] != "tool-response"
+    assert message["parentId"] == "tool-response"
+    assert message["parent_id"] == "tool-response"
+    assert message["extra"]["mcp_results"] == {
+        "openai_tools": [{"lookup": "RESULT-X"}]}
+    assert "local_mcp" not in message["feature_config"]
+    assert client.body["parentId"] == "tool-response"
+    assert client.body["parent_id"] == "tool-response"
+    assert events[0]["response_id"] == "new-response"
+
+
+def test_openai_tool_results_use_native_local_mcp_continuation():
+    be = StubBackend(turns=[
+        [{"type": "created", "response_id": "up-tool"},
+         {"type": "tool_call", "name": "lookup", "arguments": {"q": "x"}}],
+        [{"type": "created", "response_id": "up-answer"},
+         {"type": "answer", "text": "native result received"}],
+    ])
+    svc = make_service(be)
+    tools = [{"type": "function", "function": {
+        "name": "lookup", "description": "Lookup",
+        "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}]
+    m1 = [{"role": "user", "content": "lookup x"}]
+    out = chat({"model": "m", "messages": m1, "tools": tools}, svc)
+    call = _reply(out)["tool_calls"][0]
+    m2 = m1 + [_reply(out),
+               {"role": "tool", "tool_call_id": call["id"], "content": "RESULT-X"}]
+    out2 = chat({"model": "m", "messages": m2}, svc)
+    assert out2["choices"][0]["message"]["content"] == "native result received"
+    assert len(be.stream_tool_result_calls) == 1
+    chat_id, model, parent_id, results, thinking = be.stream_tool_result_calls[0]
+    assert chat_id == "chat-1" and model == "qwen3.7-plus" and parent_id == "up-tool"
+    assert results == {"openai_tools": [{"lookup": "RESULT-X"}]}
+    assert thinking is False
+
+
 def test_service_tool_roundtrip_stays_in_same_chat():
     be = StubBackend(turns=[
         [{"type": "tool_call", "name": "get_weather",
@@ -469,6 +536,30 @@ def test_service_image_part_uploads_and_picks_vision_model():
     assert "vl" in model                                   # vision routing
     assert files and files[0]["file_class"] == "vision"
     assert "what is this?" in prompt
+
+
+def test_openai_request_thinking_emits_reasoning_content():
+    be = StubBackend(turns=[[
+        {"type": "thinking", "text": "reasoning"},
+        {"type": "answer", "text": "answer"}]])
+    svc = make_service(be)
+    out = chat({"model": "m", "thinking": "low", "messages": [
+        {"role": "user", "content": "question"}]}, svc)
+    msg = _reply(out)
+    assert msg["reasoning_content"] == "reasoning"
+    assert be.thinking_calls[-1] is True
+
+
+def test_openai_request_thinking_null_is_disabled():
+    be = StubBackend(turns=[[
+        {"type": "thinking", "text": "hidden"},
+        {"type": "answer", "text": "answer"}]])
+    svc = make_service(be)
+    out = chat({"model": "m", "thinking": None, "messages": [
+        {"role": "user", "content": "question"}]}, svc)
+    msg = _reply(out)
+    assert "reasoning_content" not in msg
+    assert be.thinking_calls[-1] is False
 
 
 def test_service_streaming_chunks_shape_and_tool_finish():

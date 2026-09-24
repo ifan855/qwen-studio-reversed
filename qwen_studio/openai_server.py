@@ -352,8 +352,8 @@ class OpenAIProxyServer(ThreadingHTTPServer):
 def serve(client, *, host: str = "127.0.0.1", port: int = 8080,
           api_key: Optional[str] = None, ttl: float = 3600.0,
           max_sessions: int = 256, replay_mode: str = "both",
-          thinking: bool = False, default_model: Optional[str] = None,
-          oneshot_ttl: Optional[float] = 60.0) -> OpenAIProxyServer:
+          thinking: Optional[bool] = None, default_model: Optional[str] = None,
+          oneshot_ttl: Optional[float] = None) -> OpenAIProxyServer:
     """Build backend + service + HTTP server (call ``serve_forever`` after)."""
     from .openai_api import QwenBackend
     backend = QwenBackend(client, default_model=default_model)
