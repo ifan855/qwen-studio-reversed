@@ -162,9 +162,10 @@ turn, the conversation is revived through a replay automatically.
   conversation, so later turns can continue in the exact same Qwen project/chat
   instead of being forced through replay. The normal session TTL (default
   3600s) deletes the upstream resources when the remembered conversation
-  expires. `--oneshot-ttl` can explicitly opt into earlier cleanup, while the
-  in-memory history still survives until the main TTL. A first turn that is
-  aborted or fails is deleted immediately.
+  expires. `--oneshot-ttl` can explicitly opt into earlier cleanup, but its timer starts
+  only after the response has been fully delivered; an in-flight answer is
+  never reaped. The in-memory history still survives until the main TTL. A
+  first turn that is aborted or fails is deleted immediately.
 - Expired / evicted conversations are deleted upstream (chat, then the
   project once no fork of the conversation still uses it).
 - Failed deletions are queued and retried by the sweeper (up to 5 tries)

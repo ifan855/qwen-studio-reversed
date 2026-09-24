@@ -691,6 +691,33 @@ def test_failed_first_turn_deletes_chat_and_project():
     assert not be.chats and not be.projects and len(svc.router) == 0
 
 
+def test_oneshot_reaper_starts_after_full_answer_only():
+    """The optional one-shot TTL is measured from successful completion, not
+    from chat creation or an in-flight streaming response."""
+    be = StubBackend(turns=[[{"type": "answer", "text": "A"}]])
+    svc = make_service(be, oneshot_ttl=60)
+    kind, gen = svc.handle_chat({"model": "m", "stream": True,
+                                 "messages": [{"role": "user", "content": "a"}]},
+                                stream=True)
+    assert kind == "stream"
+
+    # While the response is still in-flight there is no completed timestamp,
+    # so the early one-shot reaper must not touch the upstream chat/project.
+    next(gen)
+    svc.sweep(now=time.time() + 61)
+    assert be.deleted_chats == [] and be.deleted_projects == []
+
+    # Drain the response to completion; only now may the reaper start its TTL.
+    list(gen)
+    (sess,) = svc.router.sessions()
+    assert sess.completed_at is not None
+    assert be.deleted_chats == [] and be.deleted_projects == []
+
+    svc.sweep(now=sess.completed_at + 61)
+    assert be.deleted_chats == ["chat-1"]
+    assert be.deleted_projects == []  # no system prompt => no project existed
+
+
 def test_oneshot_upstream_dies_after_grace_but_memory_survives():
     be = StubBackend(turns=[[{"type": "answer", "text": "A"}],
                             [{"type": "answer", "text": "B"}],

@@ -322,6 +322,7 @@ class Session:
     failures: int = 0                # consecutive failed turns in this chat
     created_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
+    completed_at: Optional[float] = None  # set only after the full answer is delivered
 
     def __post_init__(self) -> None:
         if self.views and not self.keys:
@@ -957,9 +958,10 @@ class OpenAICompatService:
         if self.oneshot_ttl is not None:
             for s in self.router.sessions():
                 if (not s.dormant and s.is_oneshot
-                        and now - s.last_used > self.oneshot_ttl):
+                        and s.completed_at is not None
+                        and now - s.completed_at > self.oneshot_ttl):
                     log.info("one-shot %s idle %.0fs -> deleting chat %s%s",
-                             s.id[:8], now - s.last_used, s.chat_id,
+                             s.id[:8], now - s.completed_at, s.chat_id,
                              f" + project {s.project_id}" if s.project
                              and s.project.refs <= 1 else "")
                     self._release_upstream(s)
@@ -1039,6 +1041,7 @@ class OpenAICompatService:
         sess.upstream_turns = 0
         sess.interrupted = False
         sess.failures = 0
+        sess.completed_at = None
 
     _expire_session = _release_upstream          # pre-0.4.1 name
 
@@ -1279,6 +1282,7 @@ class OpenAICompatService:
             sess.upstream_turns += 1
             sess.interrupted = False
             sess.failures = 0
+            sess.completed_at = time.time()
             self.router.touch(sess)
 
         def abort(error: Optional[BaseException]) -> None:
@@ -1362,6 +1366,7 @@ class OpenAICompatService:
             sess.upstream_turns = 1
             sess.interrupted = False
             sess.failures = 0
+            sess.completed_at = time.time()
             sess.set_history(views + [assistant_view])
             sess.last_assistant = full
             sess.model = model
