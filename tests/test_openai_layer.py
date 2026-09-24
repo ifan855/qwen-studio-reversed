@@ -723,6 +723,32 @@ def test_oneshot_upstream_dies_after_grace_but_memory_survives():
     assert be.stream_calls[-1][:3:2] == ("chat-2", "c")
 
 
+def test_default_single_turn_keeps_same_upstream_chat_until_session_ttl():
+    """A single-turn conversation must keep its canonical upstream chat/project
+    for the full session lifetime; early one-shot cleanup is opt-in only."""
+    be = StubBackend(turns=[[{"type": "answer", "text": "A"}],
+                            [{"type": "answer", "text": "B"}]])
+    svc = make_service(be)
+    m1 = [{"role": "system", "content": "S"}, {"role": "user", "content": "a"}]
+    chat({"model": "m", "messages": m1}, svc)
+    (sess,) = svc.router.sessions()
+
+    svc.sweep(now=time.time() + 3000)
+    assert not sess.dormant
+    assert be.deleted_chats == [] and be.deleted_projects == []
+
+    m2 = m1 + [{"role": "assistant", "content": "A"},
+               {"role": "user", "content": "b"}]
+    chat({"model": "m", "messages": m2}, svc)
+    assert be.stream_calls[-1][0] == "chat-1"
+    assert be.created == [("qwen3.7-plus", "S")]
+
+    svc.sweep(now=time.time() + 3601)
+    assert sess.dormant
+    assert be.deleted_chats == ["chat-1"] and be.deleted_projects == ["proj-1"]
+    assert len(svc.router) == 0
+
+
 def test_oneshot_reaper_can_be_disabled():
     be = StubBackend()
     svc = make_service(be, oneshot_ttl=None)

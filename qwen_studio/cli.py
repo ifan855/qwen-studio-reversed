@@ -246,11 +246,11 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--ttl", type=float, default=3600.0,
                     help="conversation memory window in seconds (default 3600)")
     ps.add_argument("--max-sessions", type=int, default=256)
-    ps.add_argument("--oneshot-ttl", type=float, default=60.0,
-                    help="delete the upstream chat + project of a "
-                         "single-turn conversation after this many idle "
-                         "seconds (default 60; its history stays in memory "
-                         "and a late follow-up revives it). -1 disables")
+    ps.add_argument("--oneshot-ttl", type=float, default=-1.0,
+                    help="optional early deletion of a single-turn "
+                         "conversation's upstream chat + project; disabled "
+                         "by default because the normal session TTL controls "
+                         "cleanup (-1 disables)")
     ps.add_argument("--replay", choices=["both", "file", "inline"],
                     default="both",
                     help="how unseen histories are replayed into a fresh "

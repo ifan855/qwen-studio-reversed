@@ -35,7 +35,7 @@ decisive discriminator).
 | `--api-key` | none | require `Authorization: Bearer <key>` from clients |
 | `--ttl` | 3600 | conversation memory window in seconds |
 | `--max-sessions` | 256 | LRU cap; evicted conversations are deleted upstream |
-| `--oneshot-ttl` | 60 | seconds before an idle *single-turn* conversation's chat + project are deleted upstream (history stays in memory); `-1` disables |
+| `--oneshot-ttl` | -1 | optional early cleanup for an idle *single-turn* conversation's chat + project; disabled by default so the same project/chat survives for the full session TTL; history is retained until the session expires |
 | `--replay` | `both` | unseen-history mode: `both`/`file`/`inline` |
 | `--thinking` | off | enable Qwen thinking -> `reasoning_content` deltas |
 | `--default-model` | first catalogue entry | used when the client's model id is unknown |
@@ -91,12 +91,14 @@ position) and tool-call arguments compared as JSON values, not strings;
 | shares a prefix, then diverges (edited / regenerated earlier turn) | **fork**: new chat in the *same project*, history replayed; the original conversation is untouched |
 | never seen | **replay mode** (below) |
 
-If a stored conversation's chat can no longer take a turn - it was reaped
-as a one-shot, deleted, or rejects the continuation (`NotFound` /
+If a stored conversation's chat can no longer take a turn - it was explicitly
+reaped by `--oneshot-ttl`, deleted, rejects the continuation (`NotFound` /
 `Bad_Request`), or failed twice in a row - the conversation is **revived**:
 a fresh chat is opened (in the same project when it still exists), the
 history is replayed into it, the dead chat is deleted, and from then on it
-continues natively again. Transient upstream states (rate limit, quota,
+continues natively again. With the default configuration, the chat is not
+reaped early and remains the canonical continuation target until the session
+TTL expires. Transient upstream states (rate limit, quota,
 anti-bot) never trigger this: they are surfaced so the client retries
 against the same chat.
 
@@ -155,12 +157,14 @@ turn, the conversation is revived through a replay automatically.
   the connection is closed immediately - probing clients cannot leave
   half-read keep-alive sockets that reset and spam `ConnectionResetError`
   tracebacks. Routine disconnects are swallowed silently.
-- **One-shot conversations die.** A conversation that never gets past its
-  first user turn (title/tag generators, autocomplete, single questions)
-  has its upstream chat **and project** deleted after `--oneshot-ttl`
-  seconds idle (default 60). Its history stays in memory for the full TTL,
-  so a late follow-up is still answered (the conversation is revived).
-  A first turn that is aborted or fails is deleted immediately.
+- **Session lifetime is authoritative.** A single-turn conversation keeps its
+  upstream chat and project alive for the same session lifetime as any other
+  conversation, so later turns can continue in the exact same Qwen project/chat
+  instead of being forced through replay. The normal session TTL (default
+  3600s) deletes the upstream resources when the remembered conversation
+  expires. `--oneshot-ttl` can explicitly opt into earlier cleanup, while the
+  in-memory history still survives until the main TTL. A first turn that is
+  aborted or fails is deleted immediately.
 - Expired / evicted conversations are deleted upstream (chat, then the
   project once no fork of the conversation still uses it).
 - Failed deletions are queued and retried by the sweeper (up to 5 tries)

@@ -40,12 +40,12 @@ How the mapping works
   broken chat) is *revived*: a fresh chat is opened, the history replayed,
   and from then on it continues natively again.
 
-* **One-shot hygiene** - a conversation with a single user turn that is not
-  continued within ``oneshot_ttl`` seconds (default 60) has its upstream
-  chat **and project deleted**; its history stays in memory, so a late
-  follow-up still works (via revival). Aborted/failed first turns are
-  deleted immediately. Failed upstream deletions are retried by the
-  sweeper instead of leaking.
+* **Session lifetime is authoritative** - a single-turn conversation keeps
+  its upstream chat/project until the normal session TTL expires. This keeps
+  late follow-ups on the exact same Qwen project/chat instead of forcing a
+  replay. ``oneshot_ttl`` is only an explicit early-cleanup override; it is
+  disabled by default. Aborted/failed first turns are still deleted
+  immediately, and failed cleanup is retried by the sweeper.
 
 * **Tools** - OpenAI ``tools`` function definitions are declared to Qwen as
   client-side MCP (``local_mcp``) tools. When the model invokes one, the
@@ -896,7 +896,7 @@ class OpenAICompatService:
                  max_sessions: int = 256, replay_mode: str = "both",
                  thinking: bool = False, max_images: int = 10,
                  sweeper_interval: float = 15.0,
-                 oneshot_ttl: Optional[float] = 60.0,
+                 oneshot_ttl: Optional[float] = None,
                  max_cleanup_attempts: int = 5) -> None:
         assert replay_mode in ("both", "file", "inline")
         self.backend = backend
@@ -935,9 +935,13 @@ class OpenAICompatService:
         self._stop.set()
 
     def sweep(self, now: Optional[float] = None, *, blocking: bool = True) -> None:
-        """Expire idle conversations, reap idle one-shots, retry failed
-        deletions. Runs under the upstream lock (skipped when busy and
-        ``blocking=False``: every request sweeps anyway)."""
+        """Expire idle conversations and retry failed deletions.
+
+        Upstream chats/projects normally live for the full session TTL. The
+        optional ``oneshot_ttl`` is an explicit early-cleanup override; it is
+        disabled by default so a single-turn conversation can continue in
+        the same upstream project/chat for the entire session lifetime.
+        """
         if not self._lock.acquire(blocking=blocking):
             return
         try:
@@ -948,6 +952,8 @@ class OpenAICompatService:
     def _sweep_locked(self, now: Optional[float] = None) -> None:
         now = now or time.time()
         self.router.sweep(now)                  # -> _release_upstream
+        # Only perform early one-shot cleanup when explicitly configured.
+        # The default lifecycle is session TTL -> upstream chat/project cleanup.
         if self.oneshot_ttl is not None:
             for s in self.router.sessions():
                 if (not s.dormant and s.is_oneshot
