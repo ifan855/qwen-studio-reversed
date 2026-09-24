@@ -10,40 +10,54 @@ How the mapping works
 ---------------------
 * **System prompts** - the completions endpoint ignores ``role:"system"``
   messages (live-verified, docs/capabilities.md). Real system prompts are
-  server-side *project* ``custom_instruction`` state: every conversation the
-  proxy opens for a request that carries a system message is created inside
-  a dedicated project holding that instruction, so it is enforced by the
-  backend and never visible on the wire.
-* **Conversation routing (the 1-hour memory)** - the proxy keeps every
-  served conversation's full OpenAI message history in memory with a TTL
-  (default 3600 s). For each incoming request it compares the request's
-  canonicalised ``messages`` against the stored histories:
+  server-side *project* ``custom_instruction`` state: a conversation that
+  carries a system message lives inside a project holding that
+  instruction, so it is enforced by the backend and never on the wire.
 
-  * exact match          -> the stored assistant reply is re-served (TTL reset);
-  * exact prefix + tail  -> the request continues that conversation: only the
-    of ``user``/``tool``   new user turn is sent to the *same* Qwen chat
-    messages               (TTL reset);
-  * anything else        -> **replay mode**: a fresh Qwen conversation is
-                           created and the whole unseen history - messages,
-                           tool calls, tool results and attachments - is
-                           prompt-engineered into it (history document
-                           uploaded as a file and/or inlined). System-prompt
-                           fidelity is preserved via the project mechanism.
+* **Conversation memory + routing** - every served conversation's full
+  OpenAI history is kept in memory (TTL, default 3600 s) together with the
+  upstream *project* and *chat* it lives in. Each request's ``messages``
+  are canonicalised (whitespace, ``developer``->``system``, text-part
+  lists vs strings, tool-call ids and argument formatting are all
+  normalised away) and matched against **every** stored conversation; the
+  best match wins:
 
-  Calling a conversation again always resets its TTL; expired or evicted
-  sessions are deleted upstream (chats + project) best-effort.
+  ======================  ==================================================
+  match                   action
+  ======================  ==================================================
+  exact / retry           re-serve the stored reply (no upstream call)
+  stored + new tail       **continue in the same project + chat**: only the
+                          new messages (user turns, tool results, anything
+                          the client added) go upstream as one turn
+  same dialog, new        update the project's instruction in place and
+  system prompt           continue in the same chat
+  shared prefix, then     fork: new chat in the *same project*, history up
+  diverges (edit/rewind)  to the latest message replayed into it
+  never seen              replay into a fresh conversation
+  ======================  ==================================================
+
+  A stored conversation whose upstream chat is gone (one-shot reaped,
+  broken chat) is *revived*: a fresh chat is opened, the history replayed,
+  and from then on it continues natively again.
+
+* **One-shot hygiene** - a conversation with a single user turn that is not
+  continued within ``oneshot_ttl`` seconds (default 60) has its upstream
+  chat **and project deleted**; its history stays in memory, so a late
+  follow-up still works (via revival). Aborted/failed first turns are
+  deleted immediately. Failed upstream deletions are retried by the
+  sweeper instead of leaking.
+
 * **Tools** - OpenAI ``tools`` function definitions are declared to Qwen as
   client-side MCP (``local_mcp``) tools. When the model invokes one, the
-  proxy answers the OpenAI client with ``finish_reason:"tool_calls"``; the
-  client executes and posts ``role:"tool"`` results back. Because the
-  upstream ``role:"function"`` continuation is server-gated
-  (docs/local-tools.md), a tool-result turn is served through replay mode -
-  the history document carries the calls *and* their results, and the tools
-  are re-declared so the model can call them again.
+  proxy answers with ``finish_reason:"tool_calls"``; the client posts the
+  ``role:"tool"`` results back and they are delivered to the *same* chat as
+  the next turn (the upstream ``role:"function"`` continuation is
+  server-gated, docs/local-tools.md). If the upstream rejects that turn the
+  proxy transparently falls back to a replay in a fresh chat.
+
 * **Files/images** - ``image_url`` (data: or https:), ``file`` and
   ``file_url`` content parts plus ``POST /v1/files`` uploads are pushed
-  through :class:`qwen_studio.files.FileService`. Verified live: far more
-  than 5 images per turn are accepted (the 5-image cap is web-UI only).
+  through :class:`qwen_studio.files.FileService`.
 
 Everything upstream is serialised through one lock and the client's request
 pacing, so a single proxy process behaves like one careful browser session.
@@ -51,13 +65,15 @@ pacing, so a single proxy process behaves like one careful browser session.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
+from typing import (Any, Callable, Dict, Generator, Iterable, Iterator, List,
+                    Optional, Tuple)
 
 from . import exceptions as exc
 from .chat import DEFAULT_FEATURE_CONFIG, ChatCompletion
@@ -69,38 +85,53 @@ log = logging.getLogger("qwen_studio.openai")
 TOOL_SERVER_NAME = "openai_tools"   # local_mcp server bucket for OpenAI tools
 HISTORY_FILENAME = "conversation-history.md"
 RETRYABLE_MARKERS = ("too many messages",)
+SYSTEM_ROLES = ("system", "developer")
+
+# Upstream failures that say nothing about the health of a particular chat
+# (anti-bot, rate limits, quota, auth): never "repair" a conversation over
+# these - surface them so the client retries against the same chat later.
+TRANSIENT_ERRORS: Tuple[type, ...] = (exc.PunishedError, exc.RateLimitedError,
+                                      exc.QuotaError, exc.AuthError)
+# Failures that mean "this particular chat cannot take the turn" (deleted,
+# rejected): the conversation is carried over into a fresh chat.
+CHAT_BROKEN_ERRORS: Tuple[type, ...] = (exc.NotFoundError, exc.BadRequestError)
 
 
 # --------------------------------------------------------------------- views
 def view_message(m: Dict[str, Any]) -> Dict[str, Any]:
-    """Reduce an OpenAI message to the fields that define its identity.
+    """Reduce an OpenAI message to the fields that define its content.
 
-    Used for history-prefix comparison: clients echo assistant messages back
-    verbatim (including ``reasoning_content`` and other decorations), so the
-    view keeps only role/content/tool_calls/tool_call_id/name and
-    normalises structured content parts.
+    Keeps role/content/tool_calls/tool_call_id and normalises structured
+    content parts; client decorations (``reasoning_content``, ``name``,
+    arbitrary extra fields) are dropped. Views are what gets stored and
+    rendered; :func:`match_key` derives the (more lenient) routing identity.
     """
     role = m.get("role")
     content = m.get("content")
     if isinstance(content, list):
         parts: List[Dict[str, Any]] = []
         for p in content:
+            if isinstance(p, str):
+                parts.append({"type": "text", "text": p})
+                continue
             if not isinstance(p, dict):
                 continue
             t = p.get("type")
-            if t == "text":
+            if t in ("text", "input_text", "output_text"):
                 parts.append({"type": "text", "text": p.get("text") or ""})
             elif t == "image_url":
-                parts.append({"type": "image_url",
-                              "url": (p.get("image_url") or {}).get("url")})
+                iu = p.get("image_url")
+                url = iu.get("url") if isinstance(iu, dict) else iu
+                parts.append({"type": "image_url", "url": url})
             elif t == "file":
                 f = p.get("file") or {}
                 parts.append({"type": "file", "file_id": f.get("file_id"),
                               "file_data": f.get("file_data"),
                               "filename": f.get("filename")})
             elif t == "file_url":
-                parts.append({"type": "file_url",
-                              "url": (p.get("file_url") or {}).get("url")})
+                fu = p.get("file_url")
+                url = fu.get("url") if isinstance(fu, dict) else fu
+                parts.append({"type": "file_url", "url": url})
             else:
                 parts.append({"type": str(t)})
         cv: Any = parts
@@ -112,18 +143,93 @@ def view_message(m: Dict[str, Any]) -> Dict[str, Any]:
     if m.get("tool_calls"):
         tcs = []
         for c in m["tool_calls"]:
+            if not isinstance(c, dict):
+                continue
             f = c.get("function") or {}
             tcs.append({"id": c.get("id"), "type": c.get("type") or "function",
                         "function": {"name": f.get("name"),
                                      "arguments": f.get("arguments")}})
-        v["tool_calls"] = tcs
+        if tcs:
+            v["tool_calls"] = tcs
     if role == "tool":
         v["tool_call_id"] = m.get("tool_call_id")
     return v
 
 
 def view_key(v: Dict[str, Any]) -> str:
+    """Exact (byte-level) identity of a view."""
     return json.dumps(v, sort_keys=True, ensure_ascii=False)
+
+
+def _norm_text(s: Any) -> str:
+    if s is None:
+        return ""
+    s = str(s).replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(line.rstrip() for line in s.split("\n")).strip()
+
+
+def _canon_args(a: Any) -> str:
+    """Tool-call arguments compared by value, not by JSON formatting."""
+    if isinstance(a, str):
+        try:
+            a = json.loads(a) if a.strip() else {}
+        except ValueError:
+            return a.strip()
+    return json.dumps(a, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"))
+
+
+def _digest(s: Optional[str]) -> str:
+    return hashlib.sha1((s or "").encode("utf-8", "ignore")).hexdigest()
+
+
+def match_key(v: Dict[str, Any]) -> str:
+    """Lenient routing identity of a message.
+
+    Clients echo our replies back with small, meaning-free differences;
+    matching on exact bytes made continuation fragile. Normalised away:
+
+    * ``developer`` vs ``system`` role;
+    * ``"text"`` vs ``[{"type":"text","text":"text"}]`` content;
+    * ``None`` vs ``""`` content, CRLF, trailing/leading whitespace;
+    * tool-call ids (tool results are identified by position) and JSON
+      formatting of tool-call arguments.
+
+    Attachments are identified by a digest of their URL / id / payload.
+    """
+    role = v.get("role")
+    if role in SYSTEM_ROLES:
+        role = "system"
+    c = v.get("content")
+    if isinstance(c, list):
+        if all(p.get("type") == "text" for p in c):
+            cv: Any = _norm_text("\n".join(p.get("text") or "" for p in c))
+        else:
+            parts: List[Any] = []
+            for p in c:
+                t = p.get("type")
+                if t == "text":
+                    txt = _norm_text(p.get("text"))
+                    if txt:
+                        parts.append(["t", txt])
+                elif t in ("image_url", "file_url"):
+                    parts.append([t[0], _digest(p.get("url"))])
+                elif t == "file":
+                    parts.append(["f", p.get("file_id") or
+                                  _digest(p.get("file_data")),
+                                  p.get("filename")])
+                else:
+                    parts.append([str(t)])
+            cv = parts
+    else:
+        cv = _norm_text(c)
+    k: Dict[str, Any] = {"r": role, "c": cv}
+    calls = [[(tc.get("function") or {}).get("name"),
+              _canon_args((tc.get("function") or {}).get("arguments"))]
+             for tc in v.get("tool_calls") or []]
+    if calls:
+        k["t"] = calls
+    return _digest(json.dumps(k, sort_keys=True, ensure_ascii=False))
 
 
 def views_of(messages: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -131,7 +237,18 @@ def views_of(messages: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def keys_of(views: List[Dict[str, Any]]) -> List[str]:
-    return [view_key(v) for v in views]
+    """Routing keys of the *dialog* part (system messages excluded)."""
+    return [match_key(v) for v in dialog_of(views)]
+
+
+def dialog_of(views: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [v for v in views if v.get("role") not in SYSTEM_ROLES]
+
+
+def system_of(views: List[Dict[str, Any]]) -> str:
+    parts = [text_of(v) for v in views
+             if v.get("role") in SYSTEM_ROLES and text_of(v)]
+    return "\n\n".join(parts).strip()
 
 
 def text_of(v: Dict[str, Any]) -> str:
@@ -152,51 +269,132 @@ def attachments_of(v: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [p for p in c if p.get("type") in ("image_url", "file", "file_url")]
 
 
+def split_latest(views: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
+                                                         List[Dict[str, Any]]]:
+    """Split a history into ``(history, latest)``.
+
+    ``latest`` is the run of dialog messages after the final assistant
+    message (the user turn(s) and/or tool results the next reply must
+    answer); ``history`` is everything before it, system messages included.
+    """
+    cut = len(views)
+    while cut > 0 and views[cut - 1].get("role") not in ("assistant",) \
+            and views[cut - 1].get("role") not in SYSTEM_ROLES:
+        cut -= 1
+    return list(views[:cut]), list(views[cut:])
+
+
 # ------------------------------------------------------------------- session
 @dataclass
+class UpstreamProject:
+    """A Qwen project (system prompt holder), ref-counted by sessions.
+
+    A project is only ever shared inside one conversation lineage (a
+    conversation and its forks) - never between unrelated conversations -
+    and is deleted when its last session releases it.
+    """
+
+    id: str
+    instruction: str
+    refs: int = 0
+
+
+@dataclass
 class Session:
-    """One served conversation (in-memory, TTL-controlled)."""
+    """One served conversation (in-memory, TTL-controlled).
+
+    ``views`` is the full canonical history *including* our last reply;
+    ``keys`` are the routing keys of its dialog part. ``chat_id is None``
+    means the conversation is *dormant*: its upstream chat was reaped
+    (one-shot hygiene) or broken, and the next continuation revives it.
+    """
 
     id: str
     views: List[Dict[str, Any]] = field(default_factory=list)
     keys: List[str] = field(default_factory=list)
+    system: str = ""
     chat_id: Optional[str] = None
-    project_id: Optional[str] = None
-    chats: List[str] = field(default_factory=list)      # every upstream chat made
+    project: Optional[UpstreamProject] = None
     model: str = ""
     last_assistant: Optional[Dict[str, Any]] = None     # full re-servable reply
-    pending_tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    upstream_turns: int = 0          # turns served in the current chat
+    interrupted: bool = False        # current chat holds an undelivered reply
+    failures: int = 0                # consecutive failed turns in this chat
     created_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
 
+    def __post_init__(self) -> None:
+        if self.views and not self.keys:
+            self.keys = keys_of(self.views)
+        if self.views and not self.system:
+            self.system = system_of(self.views)
+
+    # -------------------------------------------------------------- derived
+    @property
+    def project_id(self) -> Optional[str]:
+        return self.project.id if self.project else None
+
+    @property
+    def dormant(self) -> bool:
+        return self.chat_id is None
+
+    @property
+    def user_turns(self) -> int:
+        return sum(1 for v in self.views if v.get("role") == "user")
+
+    @property
+    def is_oneshot(self) -> bool:
+        """A conversation that never went past its first user turn."""
+        return self.user_turns <= 1
+
+    # ------------------------------------------------------------- mutation
     def touch(self) -> None:
         self.last_used = time.time()
 
-    def append(self, view: Dict[str, Any]) -> None:
-        self.views.append(view)
-        self.keys.append(view_key(view))
+    def set_history(self, views: List[Dict[str, Any]]) -> None:
+        self.views = list(views)
+        self.keys = keys_of(self.views)
+        self.system = system_of(self.views)
 
 
 @dataclass
 class Decision:
-    mode: str                                  # cached | native | new | replay
+    mode: str                    # cached | native | fork | new | replay
     session: Optional[Session] = None
     tail: List[Dict[str, Any]] = field(default_factory=list)
+    system_changed: bool = False
+
+
+def _common_prefix(a: List[str], b: List[str]) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
 
 
 class SessionRouter:
-    """In-memory conversation store with 1-hour (configurable) TTL routing."""
+    """In-memory conversation store + best-match routing.
+
+    Pure bookkeeping: the service owns upstream side effects. ``on_expire``
+    (optional) is called for sessions removed by :meth:`sweep` or LRU
+    eviction so the owner can release their upstream resources.
+    """
 
     def __init__(self, ttl: float = 3600.0, max_sessions: int = 256,
-                 on_expire: Optional[Any] = None) -> None:
+                 on_expire: Optional[Callable[[Session], Any]] = None) -> None:
         self.ttl = ttl
         self.max_sessions = max_sessions
-        self.on_expire = on_expire          # callback(session) for upstream cleanup
+        self.on_expire = on_expire
         self._sessions: Dict[str, Session] = {}
         self._order: List[str] = []         # LRU: oldest first
 
     # ------------------------------------------------------------------ book
     def add(self, sess: Session) -> None:
+        if sess.id in self._sessions:
+            self.touch(sess)
+            return
         self._sessions[sess.id] = sess
         self._order.append(sess.id)
         self._evict_over()
@@ -209,84 +407,92 @@ class SessionRouter:
     def get(self, sid: str) -> Optional[Session]:
         return self._sessions.get(sid)
 
+    def sessions(self) -> List[Session]:
+        """Oldest-first snapshot."""
+        return [self._sessions[s] for s in self._order if s in self._sessions]
+
+    def __contains__(self, sess: Session) -> bool:
+        return sess.id in self._sessions
+
     def __len__(self) -> int:
         return len(self._sessions)
 
-    def _touch_order(self, sid: str) -> None:
-        if sid in self._order:
-            self._order.remove(sid)
-        self._order.append(sid)
+    def touch(self, sess: Session) -> None:
+        if sess.id in self._order:
+            self._order.remove(sess.id)
+            self._order.append(sess.id)
+        sess.touch()
+
+    def _expire(self, sess: Session) -> None:
+        if self.on_expire:
+            try:
+                self.on_expire(sess)
+            except Exception:  # noqa: BLE001 - cleanup must never raise
+                log.debug("on_expire failed for %s", sess.id, exc_info=True)
 
     def _evict_over(self) -> None:
         while len(self._order) > self.max_sessions:
             oldest = self._order.pop(0)
             sess = self._sessions.pop(oldest, None)
-            if sess and self.on_expire:
-                try:
-                    self.on_expire(sess)
-                except Exception:  # noqa: BLE001 - cleanup must never raise
-                    pass
+            if sess:
+                self._expire(sess)
 
     # ------------------------------------------------------------------ sweep
     def sweep(self, now: Optional[float] = None) -> List[Session]:
-        """Expire sessions idle longer than the TTL; returns expired ones."""
+        """Remove sessions idle longer than the TTL; returns them."""
         now = now or time.time()
-        expired = [s for s in self._sessions.values()
-                   if now - s.last_used > self.ttl]
+        expired = [s for s in self.sessions() if now - s.last_used > self.ttl]
         for s in expired:
             self.drop(s)
-            if self.on_expire:
-                try:
-                    self.on_expire(s)
-                except Exception:  # noqa: BLE001
-                    pass
+            self._expire(s)
         return expired
 
     # ----------------------------------------------------------------- decide
     def decide(self, views: List[Dict[str, Any]]) -> Decision:
+        """Pick the best stored conversation for an incoming history.
+
+        Every stored session is scored (not just the most recent one that
+        shares a prefix): exact/retry beats continuation, a longer stored
+        history beats a shorter one, an unchanged system prompt beats a
+        changed one, and recency breaks ties.
+        """
+        system = system_of(views)
         keys = keys_of(views)
-        stale: List[Session] = []
-        result: Optional[Decision] = None
-        for sid in reversed(self._order):               # most recent first
-            sess = self._sessions.get(sid)
-            if sess is None:
+        dialog = dialog_of(views)
+        m = len(keys)
+        best: Optional[Tuple[Tuple[int, int, int], Decision]] = None
+
+        def offer(score: Tuple[int, int, int], d: Decision) -> None:
+            nonlocal best
+            if best is None or score > best[0]:     # strict: recency wins ties
+                best = (score, d)
+
+        for sess in reversed(self.sessions()):      # most recent first
+            k = sess.keys
+            n = len(k)
+            same_sys = int(sess.system == system)
+            lcp = _common_prefix(k, keys)
+            committed = bool(sess.last_assistant) and n > 0 and \
+                dialog_of(sess.views)[-1].get("role") == "assistant"
+            if not committed:
                 continue
-            n = len(sess.keys)
-            if keys == sess.keys:
-                if not sess.last_assistant:
-                    # Half-built session: it was registered for exactly this
-                    # history but its stream never completed (client
-                    # disconnect, upstream failure).  Never re-serve an empty
-                    # cache from it - forget it and re-run the request.
-                    stale.append(sess)
-                    continue
-                self._touch_order(sid)
-                sess.touch()
-                result = Decision("cached", session=sess)
-                break
-            if len(keys) > n and keys[:n] == sess.keys:
-                tail = views[n:]
-                if all(t.get("role") in ("user", "tool") for t in tail):
-                    self._touch_order(sid)
-                    sess.touch()
-                    result = Decision("native", session=sess, tail=tail)
-                    break
-                break                                    # rewound/edited -> replay
-            if len(keys) == n - 1 and keys == sess.keys[:len(keys)]:
-                # stateless retry / "continue from this exact history": the
-                # next stored turn is our own last reply -> re-serve it.
-                if sess.views and sess.views[-1].get("role") == "assistant" \
-                        and sess.last_assistant:
-                    self._touch_order(sid)
-                    sess.touch()
-                    result = Decision("cached", session=sess)
-                    break
-        for s in stale:                                   # aborted streams
-            self.drop(s)
-        if result is not None:
-            return result
-        non_system = [v for v in views if v.get("role") not in ("system", "developer")]
-        if len(non_system) == 1 and non_system[0].get("role") == "user":
+            if same_sys and lcp == m == n:
+                # exact resend of a history that ends with our reply
+                offer((4, n, 1), Decision("cached", session=sess))
+            elif same_sys and lcp == m == n - 1:
+                # stateless retry: history right up to our stored reply
+                offer((4, n, 1), Decision("cached", session=sess))
+            elif lcp == n < m:
+                offer((3, n, same_sys),
+                      Decision("native", session=sess, tail=dialog[n:],
+                               system_changed=not same_sys))
+            elif 0 < lcp < n:
+                # shares real dialog, then diverges or rewinds (edit /
+                # regenerate an earlier turn): the context lives here
+                offer((2, lcp, same_sys), Decision("fork", session=sess))
+        if best is not None:
+            return best[1]
+        if len(dialog) == 1 and dialog[0].get("role") == "user":
             return Decision("new")
         return Decision("replay")
 
@@ -308,23 +514,7 @@ def render_history_document(views: List[Dict[str, Any]],
             out.append(f"### [{i}] TOOL RESULT (for call {v.get('tool_call_id')})")
         else:
             out.append(f"### [{i}] {role}")
-        c = v.get("content")
-        if isinstance(c, list):
-            for p in c:
-                t = p.get("type")
-                if t == "text":
-                    out.append(p.get("text") or "")
-                elif t == "image_url":
-                    url = p.get("url") or ""
-                    label = url if url.startswith("http") else "inline image"
-                    out.append(f"[image attached earlier: {label}]")
-                elif t == "file":
-                    out.append(f"[file attached earlier: "
-                               f"{p.get('filename') or p.get('file_id')}]")
-                elif t == "file_url":
-                    out.append(f"[file attached earlier: {p.get('url')}]")
-        else:
-            out.append(str(c or ""))
+        out.extend(_content_lines(v))
         for tc in v.get("tool_calls") or []:
             f = tc.get("function") or {}
             out.append(f"- requested tool call `{tc.get('id')}`: "
@@ -332,6 +522,80 @@ def render_history_document(views: List[Dict[str, Any]],
                        f"`{f.get('arguments')}`")
         out.append("")
     return "\n".join(out)
+
+
+def _content_lines(v: Dict[str, Any], *, fresh: bool = False) -> List[str]:
+    """Text lines of a message; attachments become short placeholders."""
+    c = v.get("content")
+    if not isinstance(c, list):
+        return [str(c or "")]
+    when = "" if fresh else " earlier"
+    out: List[str] = []
+    for p in c:
+        t = p.get("type")
+        if t == "text":
+            out.append(p.get("text") or "")
+        elif t == "image_url":
+            url = p.get("url") or ""
+            label = url if url.startswith("http") else "inline image"
+            out.append(f"[image attached{when}: {label}]")
+        elif t == "file":
+            out.append(f"[file attached{when}: "
+                       f"{p.get('filename') or p.get('file_id')}]")
+        elif t == "file_url":
+            out.append(f"[file attached{when}: {p.get('url')}]")
+    return out
+
+
+def render_continuation(latest: List[Dict[str, Any]],
+                        context: List[Dict[str, Any]] = ()) -> str:
+    """The upstream prompt for the messages that arrived since our last
+    reply (one user turn, tool results, or any mix the client produced).
+
+    ``context`` is the preceding history, used to name tool results after
+    the calls that requested them.
+    """
+    if len(latest) == 1 and latest[0].get("role") == "user":
+        return text_of(latest[0]) or "(continue)"
+    if not latest:
+        return "Continue the conversation from where it left off."
+    names: Dict[Optional[str], str] = {}
+    for v in list(context) + list(latest):
+        for tc in v.get("tool_calls") or []:
+            names[tc.get("id")] = (tc.get("function") or {}).get("name") or "tool"
+    only_tools = all(v.get("role") == "tool" for v in latest)
+    blocks: List[str] = []
+    if only_tools:
+        blocks.append("Here are the results of the tool call(s) you just "
+                      "requested:")
+    else:
+        blocks.append("New messages since your last reply, in order:")
+    for v in latest:
+        role = v.get("role")
+        body = "\n".join(_content_lines(v, fresh=True)).strip() or "(empty)"
+        if role == "tool":
+            cid = v.get("tool_call_id")
+            blocks.append(f"### Tool result: {names.get(cid, 'tool')} "
+                          f"(call {cid})\n{body}")
+        elif role == "assistant":
+            lines = [body] if body != "(empty)" else []
+            for tc in v.get("tool_calls") or []:
+                f = tc.get("function") or {}
+                lines.append(f"- called tool {f.get('name')} with "
+                             f"{f.get('arguments')}")
+            blocks.append("### Assistant (already sent)\n" +
+                          ("\n".join(lines) or "(empty)"))
+        else:
+            blocks.append(f"### User\n{body}")
+    last = latest[-1].get("role")
+    if last == "tool":
+        blocks.append("Continue using these results: answer the user, or "
+                      "call a tool again if you still need more.")
+    elif last == "user":
+        blocks.append("Respond to the latest user message now.")
+    else:
+        blocks.append("Continue.")
+    return "\n\n".join(blocks)
 
 
 def build_replay_prompt(latest_text: str, transcript: str, *,
@@ -355,6 +619,10 @@ def build_replay_prompt(latest_text: str, transcript: str, *,
             f"\"{HISTORY_FILENAME}\" - read it first.\n\n"
             f"Latest user message:\n{latest_text}\n\n"
             f"Respond to the latest user message now.")
+
+
+INTERRUPTED_NOTE = ("(Note: your previous reply in this chat was cut off "
+                    "and never reached the user - disregard it.)\n\n")
 
 
 # ------------------------------------------------------------------ backend
@@ -415,28 +683,55 @@ class QwenBackend:
         return self.q.files.upload(data, filename, content_type)
 
     # ------------------------------------------------------------ lifecycle
+    # Primitive operations raise on failure: the service decides what to do
+    # (retry deletions later, fall back, surface the error).
+    def create_project(self, instruction: str) -> str:
+        """A project whose ``custom_instruction`` is the system prompt (the
+        official server-side system-prompt mechanism)."""
+        proj = self.q.projects.create(
+            f"openai-proxy-{uuid.uuid4().hex[:8]}",
+            description="created by the qwen-studio OpenAI-compatible proxy",
+            custom_instruction=instruction)
+        if not proj.id:
+            raise exc.APIError("project creation returned no id")
+        return proj.id
+
+    def open_chat(self, model: str, project_id: Optional[str] = None) -> str:
+        chat = self.q.chats.create(model, project_id=project_id or "")
+        if not chat.id:
+            raise exc.APIError("chat creation returned no id")
+        return chat.id
+
+    def set_instruction(self, project_id: str, instruction: str) -> None:
+        """Change a live project's system prompt in place."""
+        self.q.projects.set_system_prompt(project_id, instruction)
+
+    def delete_chat(self, chat_id: str) -> None:
+        try:
+            self.q.chats.delete(chat_id)
+        except exc.NotFoundError:
+            pass                                   # already gone == success
+
+    def delete_project(self, project_id: str) -> None:
+        try:
+            self.q.projects.delete(project_id)
+        except exc.NotFoundError:
+            pass
+
+    # Backwards-compatible conveniences (pre-0.4.1 interface).
     def create_chat(self, model: str, system_prompt: str) -> Tuple[str, Optional[str]]:
-        """Create the upstream conversation; inside a project when a system
-        prompt exists (the official server-side system-prompt mechanism)."""
-        if system_prompt.strip():
-            proj = self.q.projects.create(
-                f"openai-proxy-{uuid.uuid4().hex[:8]}",
-                description="created by the qwen-studio OpenAI-compatible proxy",
-                custom_instruction=system_prompt)
-            chat = self.q.chats.create(model, project_id=proj.id)
-            return chat.id, proj.id
-        chat = self.q.chats.create(model)
-        return chat.id, None
+        pid = self.create_project(system_prompt) if system_prompt.strip() else None
+        return self.open_chat(model, pid), pid
 
     def cleanup(self, chat_ids: List[str], project_id: Optional[str]) -> None:
         for cid in chat_ids:
             try:
-                self.q.chats.delete(cid)
+                self.delete_chat(cid)
             except Exception:  # noqa: BLE001
                 pass
         if project_id:
             try:
-                self.q.projects.delete(project_id)
+                self.delete_project(project_id)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -508,6 +803,8 @@ class QwenBackend:
         yield {"type": "done", "response_id": response_id}
 
 
+
+
 # ------------------------------------------------------------------- service
 @dataclass
 class Attachment:
@@ -522,6 +819,33 @@ class Plan:
     session: Optional[Session] = None
     cached: Optional[Dict[str, Any]] = None       # full json reply (cached mode)
     gen: Optional[Generator[Dict[str, Any], None, None]] = None
+
+
+def _prime(events: Iterator[Dict[str, Any]]) -> Generator[Dict[str, Any], None, None]:
+    """Pull the first upstream event *now*.
+
+    Request-level upstream failures (chat rejected, bad request, punish
+    page) then surface while the request is still being planned - before a
+    single byte reaches the client - so they can be recovered from (e.g. by
+    reviving the conversation in a fresh chat) or returned as a proper HTTP
+    error instead of a broken SSE stream.
+    """
+    try:
+        first = next(events)
+    except StopIteration:
+        first = None
+
+    def chain() -> Generator[Dict[str, Any], None, None]:
+        try:
+            if first is not None:
+                yield first
+                yield from events
+        finally:
+            close = getattr(events, "close", None)
+            if close is not None:
+                close()
+
+    return chain()
 
 
 class _LockedStream:
@@ -571,15 +895,21 @@ class OpenAICompatService:
     def __init__(self, backend: QwenBackend, *, ttl: float = 3600.0,
                  max_sessions: int = 256, replay_mode: str = "both",
                  thinking: bool = False, max_images: int = 10,
-                 sweeper_interval: float = 60.0) -> None:
+                 sweeper_interval: float = 15.0,
+                 oneshot_ttl: Optional[float] = 60.0,
+                 max_cleanup_attempts: int = 5) -> None:
         assert replay_mode in ("both", "file", "inline")
         self.backend = backend
         self.replay_mode = replay_mode
         self.thinking = thinking
         self.max_images = max_images
+        self.oneshot_ttl = oneshot_ttl
+        self.max_cleanup_attempts = max_cleanup_attempts
         self.router = SessionRouter(ttl=ttl, max_sessions=max_sessions,
-                                    on_expire=self._expire_session)
+                                    on_expire=self._release_upstream)
         self.file_store: Dict[str, Dict[str, Any]] = {}   # file-<hex> -> record
+        # upstream deletions that failed and will be retried: (kind, id, tries)
+        self.graveyard: List[Tuple[str, str, int]] = []
         self._lock = threading.RLock()
         self._sweeper: Optional[threading.Thread] = None
         self._sweeper_interval = sweeper_interval
@@ -593,9 +923,9 @@ class OpenAICompatService:
         def run() -> None:
             while not self._stop.wait(self._sweeper_interval):
                 try:
-                    self.router.sweep()
+                    self.sweep(blocking=False)
                 except Exception:  # noqa: BLE001
-                    pass
+                    log.debug("sweep failed", exc_info=True)
 
         self._sweeper = threading.Thread(target=run, daemon=True,
                                          name="qwen-oai-ttl-sweeper")
@@ -604,13 +934,107 @@ class OpenAICompatService:
     def stop_sweeper(self) -> None:
         self._stop.set()
 
-    def _expire_session(self, sess: Session) -> None:
-        log.info("session %s expired -> cleaning %d chat(s), project=%s",
-                 sess.id[:8], len(sess.chats), sess.project_id)
+    def sweep(self, now: Optional[float] = None, *, blocking: bool = True) -> None:
+        """Expire idle conversations, reap idle one-shots, retry failed
+        deletions. Runs under the upstream lock (skipped when busy and
+        ``blocking=False``: every request sweeps anyway)."""
+        if not self._lock.acquire(blocking=blocking):
+            return
         try:
-            self.backend.cleanup(sess.chats, sess.project_id)
-        except Exception:  # noqa: BLE001
-            pass
+            self._sweep_locked(now)
+        finally:
+            self._lock.release()
+
+    def _sweep_locked(self, now: Optional[float] = None) -> None:
+        now = now or time.time()
+        self.router.sweep(now)                  # -> _release_upstream
+        if self.oneshot_ttl is not None:
+            for s in self.router.sessions():
+                if (not s.dormant and s.is_oneshot
+                        and now - s.last_used > self.oneshot_ttl):
+                    log.info("one-shot %s idle %.0fs -> deleting chat %s%s",
+                             s.id[:8], now - s.last_used, s.chat_id,
+                             f" + project {s.project_id}" if s.project
+                             and s.project.refs <= 1 else "")
+                    self._release_upstream(s)
+        self._retry_graveyard()
+
+    def shutdown(self, timeout: float = 10.0) -> None:
+        """Stop the sweeper and delete everything still held upstream."""
+        self.stop_sweeper()
+        got = self._lock.acquire(timeout=timeout)
+        try:
+            for s in self.router.sessions():
+                self.router.drop(s)
+                self._release_upstream(s)
+            self._retry_graveyard(final=True)
+        finally:
+            if got:
+                self._lock.release()
+
+    # ------------------------------------------------- upstream resources
+    def _acquire_project(self, instruction: str,
+                         reuse: Optional[UpstreamProject] = None
+                         ) -> Optional[UpstreamProject]:
+        """Project for a new chat: reuse the lineage's project when its
+        instruction matches, else create one (none without a prompt)."""
+        if reuse is not None and reuse.refs > 0 and reuse.instruction == instruction:
+            reuse.refs += 1
+            return reuse
+        if not instruction.strip():
+            return None
+        return UpstreamProject(self.backend.create_project(instruction),
+                               instruction, refs=1)
+
+    def _release_project(self, proj: Optional[UpstreamProject]) -> None:
+        if proj is None:
+            return
+        proj.refs -= 1
+        if proj.refs <= 0:
+            self._delete("project", proj.id)
+
+    def _delete(self, kind: str, rid: str) -> None:
+        try:
+            if kind == "chat":
+                self.backend.delete_chat(rid)
+            else:
+                self.backend.delete_project(rid)
+        except Exception as e:  # noqa: BLE001 - never raise from cleanup
+            log.warning("could not delete %s %s (%s); will retry", kind, rid, e)
+            self.graveyard.append((kind, rid, 1))
+
+    def _retry_graveyard(self, final: bool = False) -> None:
+        if not self.graveyard:
+            return
+        pending, self.graveyard = self.graveyard, []
+        pending.sort(key=lambda x: x[0] != "chat")      # chats before projects
+        for kind, rid, tries in pending:
+            try:
+                if kind == "chat":
+                    self.backend.delete_chat(rid)
+                else:
+                    self.backend.delete_project(rid)
+            except Exception as e:  # noqa: BLE001
+                if final or tries + 1 >= self.max_cleanup_attempts:
+                    log.error("giving up deleting %s %s after %d tries: %s",
+                              kind, rid, tries + 1, e)
+                else:
+                    self.graveyard.append((kind, rid, tries + 1))
+
+    def _release_upstream(self, sess: Session) -> None:
+        """Delete a session's chat and drop its project reference (the
+        project dies with its last user). The session becomes dormant; its
+        history is untouched."""
+        if sess.chat_id:
+            self._delete("chat", sess.chat_id)
+        self._release_project(sess.project)
+        sess.chat_id = None
+        sess.project = None
+        sess.upstream_turns = 0
+        sess.interrupted = False
+        sess.failures = 0
+
+    _expire_session = _release_upstream          # pre-0.4.1 name
 
     # ----------------------------------------------------------- /v1/models
     def handle_models(self) -> Dict[str, Any]:
@@ -670,19 +1094,35 @@ class OpenAICompatService:
             raise exc.BadRequestError("messages must be a non-empty array",
                                       code="invalid_request_error")
         views = views_of(messages)
-        self.router.sweep()
+        if not dialog_of(views):
+            raise exc.BadRequestError(
+                "messages must contain at least one non-system message",
+                code="invalid_request_error")
+        self._sweep_locked()
         decision = self.router.decide(views)
-        log.info("route -> %s (%d msgs, %d sessions in memory)",
-                 decision.mode, len(views), len(self.router))
+        sess = decision.session
+        log.info("route -> %s%s (%d msgs, %d conversations in memory)",
+                 decision.mode,
+                 f" [{sess.id[:8]} chat={sess.chat_id}]" if sess else "",
+                 len(views), len(self.router))
         tools_decl = self.backend.declare_tools(body.get("tools") or [])
         if decision.mode == "cached":
-            return self._plan_cached(decision.session)          # type: ignore[arg-type]
+            assert sess is not None
+            self.router.touch(sess)
+            return Plan(mode="cached", session=sess,
+                        cached=dict(sess.last_assistant or {}))
         if decision.mode == "native":
-            return self._plan_native(decision.session, decision.tail,  # type: ignore[arg-type]
-                                     tools_decl, body)
-        if decision.mode == "new":
-            return self._plan_new(views, tools_decl, body)
-        return self._plan_replay(views, tools_decl, body)
+            assert sess is not None
+            if sess.dormant or sess.failures >= 2:
+                return self._plan_open(views, tools_decl, body, mode="revive",
+                                       session=sess, reuse_project=sess.project)
+            return self._plan_native(sess, views, decision, tools_decl, body)
+        if decision.mode == "fork":
+            assert sess is not None
+            return self._plan_open(views, tools_decl, body, mode="fork",
+                                   reuse_project=sess.project)
+        return self._plan_open(views, tools_decl, body, mode=decision.mode)
+
 
     # ---------------------------------------------------------------- pieces
     def _collect_attachments(self, view: Dict[str, Any]) -> List[Attachment]:
@@ -755,151 +1195,200 @@ class OpenAICompatService:
                  if v.get("role") in ("system", "developer") and text_of(v)]
         return "\n\n".join(parts).strip()
 
-    def _finish(self, sess: Session, assistant_view: Dict[str, Any],
-                full: Dict[str, Any]) -> None:
-        sess.append(assistant_view)
-        sess.last_assistant = full
-        sess.pending_tool_calls = full.get("tool_calls") or []
-        sess.touch()
 
-    def _drop_session(self, sess: Optional[Session]) -> None:
-        """On upstream failure: forget the session so retries rebuild cleanly."""
-        if sess is not None:
-            self.router.drop(sess)
+    def _collect_many(self, views: List[Dict[str, Any]]) -> List[Attachment]:
+        """Attachments of every user message in ``views`` (one turn)."""
+        out: List[Attachment] = []
+        for v in views:
+            if v.get("role") == "user":
+                out.extend(self._collect_attachments(v))
+        images = [a for a in out if a.content_type.startswith("image/")]
+        if len(images) > self.max_images:
+            raise exc.BadRequestError(
+                f"too many images in one turn ({len(images)} > {self.max_images})",
+                code="invalid_request_error")
+        return out
+
+    def _retarget_instruction(self, sess: Session, system: str) -> bool:
+        """The client changed the system prompt of a live conversation:
+        update the project's instruction in place when the project belongs
+        to this conversation alone. False -> caller opens a new chat."""
+        proj = sess.project
+        if proj is None or proj.refs > 1:
+            return False
+        try:
+            self.backend.set_instruction(proj.id, system)
+        except TRANSIENT_ERRORS:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not update project %s instruction (%s); "
+                        "opening a new chat instead", proj.id, e)
+            return False
+        proj.instruction = system
+        sess.system = system
+        return True
 
     # ----------------------------------------------------------- plan modes
-    def _plan_cached(self, sess: Session) -> Plan:
-        full = dict(sess.last_assistant or {})
-        return Plan(mode="cached", session=sess, cached=full)
-
-    def _plan_native(self, sess: Session, tail: List[Dict[str, Any]],
-                     tools_decl: Dict[str, Any], body: Dict[str, Any]) -> Plan:
-        last_user = next((v for v in reversed(tail) if v.get("role") == "user"), None)
-        if last_user is None:
-            # tool-only tail should not happen (decide routes it to replay);
-            # be defensive and replay the whole thing.
-            return self._plan_replay(sess.views + tail, tools_decl, body)
+    def _plan_native(self, sess: Session, views: List[Dict[str, Any]],
+                     decision: Decision, tools_decl: Dict[str, Any],
+                     body: Dict[str, Any]) -> Plan:
+        """Continue a stored conversation in its own project + chat: only the
+        messages the client added since our last reply go upstream."""
+        tail = decision.tail
+        system = system_of(views)
+        if decision.system_changed and not self._retarget_instruction(sess, system):
+            return self._plan_open(views, tools_decl, body, mode="fork")
+        atts = self._collect_many(tail)          # client errors surface as-is
+        model = self.backend.resolve_model(
+            body.get("model") or sess.model,
+            has_images=any(a.content_type.startswith("image/") for a in atts))
+        entries = self._upload_entries(atts)
+        prompt = render_continuation(tail, sess.views)
+        if sess.interrupted:
+            prompt = INTERRUPTED_NOTE + prompt
         try:
-            atts = self._collect_attachments(last_user)
-            entries = self._upload_entries(atts)
-            model = self.backend.resolve_model(
-                body.get("model") or sess.model,
-                has_images=any(a.content_type.startswith("image/") for a in atts))
-            prompt = text_of(last_user) or "(continue)"
-            events = self.backend.stream_turn(
+            events = _prime(self.backend.stream_turn(
                 sess.chat_id, model, prompt, files_entries=entries,
-                tools_decl=tools_decl, thinking=self.thinking)
+                tools_decl=tools_decl, thinking=self.thinking))
+        except CHAT_BROKEN_ERRORS as e:
+            # the chat itself rejected the turn (deleted, broken, gated):
+            # carry the conversation over into a fresh chat, same project
+            log.warning("chat %s rejected the continuation (%s); reviving "
+                        "conversation %s in a fresh chat", sess.chat_id, e,
+                        sess.id[:8])
+            return self._plan_open(views, tools_decl, body, mode="revive",
+                                   session=sess, reuse_project=sess.project)
+        except TRANSIENT_ERRORS:
+            raise                                # chat is fine; client retries
         except Exception:
-            self._drop_session(sess)
+            # unknown upstream hiccup: keep the chat, but after repeated
+            # failures the next request revives the conversation elsewhere
+            sess.failures += 1
             raise
-        # commit the new user/tool turns so the stored history stays a true
-        # prefix of what the client holds (routing + caching depend on it)
-        for v in tail:
-            sess.append(v)
-        sess.touch()
+
+        def commit(assistant_view: Dict[str, Any], full: Dict[str, Any]) -> None:
+            sess.set_history(views + [assistant_view])
+            sess.last_assistant = full
+            sess.model = model
+            sess.upstream_turns += 1
+            sess.interrupted = False
+            sess.failures = 0
+            self.router.touch(sess)
+
+        def abort(error: Optional[BaseException]) -> None:
+            # The upstream chat now holds a partial/undelivered turn; the
+            # conversation itself is intact - keep it, flag the chat.
+            sess.interrupted = True
+            if error is not None and not isinstance(
+                    error, (GeneratorExit,) + TRANSIENT_ERRORS):
+                sess.failures += 1
+
         return Plan(mode="native", session=sess,
-                    gen=self._drive(sess, events, model, sess.views))
+                    gen=self._drive(events, model, commit, abort))
 
-    def _plan_new(self, views: List[Dict[str, Any]],
-                  tools_decl: Dict[str, Any], body: Dict[str, Any]) -> Plan:
-        system = self._system_prompt(views)
-        last = views[-1]
-        sess = Session(id=uuid.uuid4().hex, views=list(views),
-                       keys=keys_of(views))
-        try:
-            atts = self._collect_attachments(last)
-        except Exception:
-            self._drop_session(sess)
-            raise
-        # resolve the model first (needs attachment info for vision routing)
-        try:
-            model = self.backend.resolve_model(
-                body.get("model") or "",
-                has_images=any(a.content_type.startswith("image/") for a in atts))
-            chat_id, project_id = self.backend.create_chat(model, system)
-        except Exception:
-            self._drop_session(sess)
-            raise
-        sess.chat_id = chat_id
-        sess.project_id = project_id
-        sess.chats = [chat_id]
-        sess.model = model
-        try:
-            entries = self._upload_entries(atts)
-            events = self.backend.stream_turn(
-                chat_id, model, text_of(last) or "(begin)",
-                files_entries=entries, tools_decl=tools_decl,
-                thinking=self.thinking)
-        except Exception:
-            self._drop_session(sess)
-            raise
-        self.router.add(sess)
-        return Plan(mode="new", session=sess,
-                    gen=self._drive(sess, events, model, views))
+    def _plan_open(self, views: List[Dict[str, Any]],
+                   tools_decl: Dict[str, Any], body: Dict[str, Any], *,
+                   mode: str, session: Optional[Session] = None,
+                   reuse_project: Optional[UpstreamProject] = None) -> Plan:
+        """Open a fresh upstream chat for ``views`` and answer its latest turn.
 
-    def _plan_replay(self, views: List[Dict[str, Any]],
-                     tools_decl: Dict[str, Any], body: Dict[str, Any]) -> Plan:
-        system = self._system_prompt(views)
-        last = views[-1]
-        if last.get("role") == "tool":
-            # A tool-result turn: the answer continues the pending tool call.
-            prompt_tail = "Provide the next assistant turn using the tool results above."
-        else:
-            prompt_tail = text_of(last)
-        sess = Session(id=uuid.uuid4().hex, views=list(views),
-                       keys=keys_of(views))
+        ``new``     single user message -> plain first turn.
+        ``replay``  unseen history -> engineered replay prompt (+ file).
+        ``fork``    diverged from a stored conversation -> replay, reusing
+                    that conversation's project when the prompt matches.
+        ``revive``  a stored conversation whose chat is gone/broken ->
+                    replay into a new chat; the session keeps its identity.
+
+        Nothing is registered until the reply completes; if it does not, the
+        new chat (and project, if unshared) is deleted on the spot.
+        """
+        system = system_of(views)
+        history, latest = split_latest(views)
+        atts = self._collect_many(latest)
+        model = self.backend.resolve_model(
+            body.get("model") or (session.model if session else ""),
+            has_images=any(a.content_type.startswith("image/") for a in atts))
+        project: Optional[UpstreamProject] = None
+        chat_id: Optional[str] = None
         try:
-            atts = self._collect_attachments(last)
-            model = self.backend.resolve_model(
-                body.get("model") or "",
-                has_images=any(a.content_type.startswith("image/") for a in atts))
-            transcript = render_history_document(views[:-1], system)
-            prompt = build_replay_prompt(prompt_tail or "(continue)",
-                                         transcript,
-                                         inline=self.replay_mode in ("both", "inline"))
-            chat_id, project_id = self.backend.create_chat(model, system)
-        except Exception:
-            self._drop_session(sess)
-            raise
-        sess.chat_id = chat_id
-        sess.project_id = project_id
-        sess.chats = [chat_id]
-        sess.model = model
-        try:
-            entries = []
-            if self.replay_mode in ("both", "file"):
-                doc = render_history_document(views, system).encode("utf-8")
-                try:
-                    ref = self.backend.upload(doc, HISTORY_FILENAME,
-                                              "text/markdown")
-                    entries.append(ref.entry(file_class="document",
-                                             show_type="file",
-                                             entry_type="file"))
-                except Exception:  # noqa: BLE001 - fall back to inline text
-                    prompt = build_replay_prompt(prompt_tail or "(continue)",
-                                                 transcript, inline=True)
+            project = self._acquire_project(system, reuse_project)
+            chat_id = self.backend.open_chat(model, project.id if project else None)
+            latest_text = render_continuation(latest, history)
+            entries: List[Dict[str, Any]] = []
+            if not dialog_of(history):
+                prompt = latest_text if text_of(latest[-1]) or len(latest) > 1 \
+                    else "(begin)"
+            else:
+                transcript = render_history_document(history, system)
+                prompt = build_replay_prompt(
+                    latest_text, transcript,
+                    inline=self.replay_mode in ("both", "inline"))
+                if self.replay_mode in ("both", "file"):
+                    doc = transcript.encode("utf-8")
+                    try:
+                        ref = self.backend.upload(doc, HISTORY_FILENAME,
+                                                  "text/markdown")
+                        entries.append(ref.entry(file_class="document",
+                                                 show_type="file",
+                                                 entry_type="file"))
+                    except TRANSIENT_ERRORS:
+                        raise
+                    except Exception:  # noqa: BLE001 - fall back to inline
+                        prompt = build_replay_prompt(latest_text, transcript,
+                                                     inline=True)
             entries += self._upload_entries(atts)
-            events = self.backend.stream_turn(
+            events = _prime(self.backend.stream_turn(
                 chat_id, model, prompt, files_entries=entries,
-                tools_decl=tools_decl, thinking=self.thinking)
-        except Exception:
-            self._drop_session(sess)
+                tools_decl=tools_decl, thinking=self.thinking))
+        except BaseException:
+            if chat_id:
+                self._delete("chat", chat_id)
+            self._release_project(project)
             raise
-        self.router.add(sess)
-        return Plan(mode="replay", session=sess,
-                    gen=self._drive(sess, events, model, views))
+
+        sess = session if session is not None else Session(id=uuid.uuid4().hex)
+
+        def commit(assistant_view: Dict[str, Any], full: Dict[str, Any]) -> None:
+            if sess.chat_id or sess.project:
+                self._release_upstream(sess)     # the chat we moved away from
+            sess.chat_id = chat_id
+            sess.project = project
+            sess.upstream_turns = 1
+            sess.interrupted = False
+            sess.failures = 0
+            sess.set_history(views + [assistant_view])
+            sess.last_assistant = full
+            sess.model = model
+            self.router.add(sess)
+            self.router.touch(sess)
+
+        def abort(error: Optional[BaseException]) -> None:
+            # never delivered -> this chat is garbage; kill it right away
+            if chat_id:
+                self._delete("chat", chat_id)
+            self._release_project(project)
+
+        return Plan(mode=mode, session=sess,
+                    gen=self._drive(events, model, commit, abort))
 
     # ------------------------------------------------------------- draining
-    def _drive(self, sess: Session, events: Generator[Dict[str, Any], None, None],
-               model: str, request_views: List[Dict[str, Any]]) -> Generator[
-                   Dict[str, Any], None, None]:
-        """Consume upstream events, emit OpenAI chunk dicts, then commit."""
+    def _drive(self, events: Iterator[Dict[str, Any]], model: str,
+               on_commit: Callable[[Dict[str, Any], Dict[str, Any]], None],
+               on_abort: Callable[[Optional[BaseException]], None]
+               ) -> Generator[Dict[str, Any], None, None]:
+        """Consume upstream events, emit OpenAI chunk dicts, then commit.
+
+        ``on_commit`` runs only once the whole reply has been handed to the
+        client; any interruption (client disconnect, upstream error) calls
+        ``on_abort`` instead, so memory never holds an undelivered reply.
+        """
         reply_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         answer: List[str] = []
         think: List[str] = []
         calls: List[Dict[str, Any]] = []
         first = True
+        finish = "stop"
         try:
             for ev in events:
                 if ev["type"] == "answer":
@@ -928,19 +1417,13 @@ class OpenAICompatService:
                                  first=first)
                     first = False
             finish = "tool_calls" if calls else "stop"
-            yield _chunk(reply_id, created, model, {}, finish_reason=finish)
-        except GeneratorExit:
-            # client disconnected mid-stream: the reply was never committed.
-            # Forget the half-built session and clean the abandoned upstream
-            # conversation so a resend re-runs instead of re-serving blank.
-            self.router.drop(sess)
+            yield _chunk(reply_id, created, model, {}, finish_reason=finish,
+                         first=first)
+        except BaseException as e:
             try:
-                self.backend.cleanup(sess.chats, sess.project_id)
-            except Exception:  # noqa: BLE001 - cleanup must never raise
-                pass
-            raise
-        except Exception:
-            self._drop_session(sess)
+                on_abort(e)
+            except Exception:  # noqa: BLE001 - cleanup must never mask
+                log.debug("abort handler failed", exc_info=True)
             raise
         content = "".join(answer)
         msg: Dict[str, Any] = {"role": "assistant",
@@ -954,7 +1437,7 @@ class OpenAICompatService:
                 "created": created, "model": model,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
                 "usage": _null_usage()}
-        self._finish(sess, view_message(msg), full)
+        on_commit(view_message(msg), full)
 
     # ------------------------------------------------------------- streaming
     def stream_cached(self, full: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:

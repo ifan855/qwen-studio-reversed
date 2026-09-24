@@ -49,9 +49,6 @@ print("OpenAI-compatible API on http://127.0.0.1:8080/v1  (Ctrl-C to stop)")
 try:
     server.serve_forever()
 except KeyboardInterrupt:
-    service.stop_sweeper()
-    for s in list(service.router._sessions.values()):
-        service.router.drop(s)
-        service._expire_session(s)
+    service.shutdown()          # deletes every chat/project still upstream
     server.server_close()
     print("stopped; conversations cleaned up upstream.")

@@ -174,7 +174,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     service = OpenAICompatService(
         backend, ttl=args.ttl, max_sessions=args.max_sessions,
-        replay_mode=args.replay, thinking=args.thinking)
+        replay_mode=args.replay, thinking=args.thinking,
+        oneshot_ttl=None if args.oneshot_ttl < 0 else args.oneshot_ttl)
     service.start_sweeper()
     server = OpenAIProxyServer((args.host, args.port), service,
                                api_key=args.api_key)
@@ -182,6 +183,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
     print(f"OpenAI-compatible API on http://{args.host}:{args.port}/v1")
     print(f"  history memory   : {int(args.ttl)}s TTL, "
           f"max {args.max_sessions} conversations")
+    print("  one-shot cleanup : " + (
+        "off" if args.oneshot_ttl < 0 else
+        f"single-turn conversations' chat + project deleted after "
+        f"{int(args.oneshot_ttl)}s idle (history kept; follow-ups revive)"))
     print(f"  replay mode      : {args.replay} (unseen histories are "
           f"prompt-engineered in)")
     print(f"  api key          : {'required' if args.api_key else 'not set'}")
@@ -191,11 +196,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        service.stop_sweeper()
         try:
-            for s in list(service.router._sessions.values()):
-                service.router.drop(s)
-                service._expire_session(s)
+            service.shutdown()
         except Exception:  # noqa: BLE001
             pass
         server.server_close()
@@ -244,6 +246,11 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--ttl", type=float, default=3600.0,
                     help="conversation memory window in seconds (default 3600)")
     ps.add_argument("--max-sessions", type=int, default=256)
+    ps.add_argument("--oneshot-ttl", type=float, default=60.0,
+                    help="delete the upstream chat + project of a "
+                         "single-turn conversation after this many idle "
+                         "seconds (default 60; its history stays in memory "
+                         "and a late follow-up revives it). -1 disables")
     ps.add_argument("--replay", choices=["both", "file", "inline"],
                     default="both",
                     help="how unseen histories are replayed into a fresh "

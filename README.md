@@ -19,8 +19,9 @@ qwen-studio login
 # another command: serve a full OpenAI-compatible API wrapping Qwen Studio
 qwen-studio serve --port 8080 --api-key sk-my-secret
 #   system prompts (server-side enforced), tools via the MCP wrap,
-#   image/file uploads, 1-hour in-memory conversation history with
-#   automatic routing of continuations, replay of unseen histories.
+#   image/file uploads, 1-hour in-memory conversation history: follow-ups
+#   continue in the same Qwen project + chat, unseen histories are replayed,
+#   one-shot conversations are deleted upstream after 60 s idle.
 ```
 
 Any OpenAI client works: `OpenAI(base_url="http://127.0.0.1:8080/v1")`.
@@ -54,8 +55,10 @@ Every other constructor (`from_credentials`, `from_session_token`,
   (`/v1/chat/completions` streaming + non-streaming, `/v1/models`,
   `/v1/files`; system prompts via the project mechanism, OpenAI `tools`
   through the MCP wrap, image/file content parts, 1-hour in-memory
-  conversation history with exact-prefix routing and engineered replay of
-  unseen histories; see [docs/openai-server.md](docs/openai-server.md))
+  conversation history - continuations (incl. tool results) stay in the same
+  Qwen project + chat, with lenient matching, forks, revival of dead chats
+  and engineered replay of unseen histories; one-shot conversations are
+  deleted upstream; see [docs/openai-server.md](docs/openai-server.md))
 - **Browser session import (v0.2.0)** — pull the complete cookie jar
   (session token + anti-bot set) directly from Firefox, Chrome, Chromium,
   Brave or Edge profiles on Linux, incl. snap/flatpak paths, locked-DB

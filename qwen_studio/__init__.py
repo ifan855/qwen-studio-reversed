@@ -25,7 +25,7 @@ from . import browser_cookies, exceptions
 from .browser_cookies import (BrowserCookie, BrowserCookieError,
                               load_browser_cookies, qwen_cookie_dict)
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "QwenStudio",

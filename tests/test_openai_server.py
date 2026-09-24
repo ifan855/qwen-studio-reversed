@@ -37,16 +37,25 @@ class StubBackend:
     def declare_tools(self, tools):
         return {}
 
-    def create_chat(self, model, system_prompt):
-        self.created.append((model, system_prompt))
+    def create_project(self, instruction):
+        return f"proj-{len(self.created)}"
+
+    def open_chat(self, model, project_id=None):
+        self.created.append((model, project_id))
         self.chat_seq += 1
-        return f"chat-{self.chat_seq}", None
+        return f"chat-{self.chat_seq}"
+
+    def set_instruction(self, project_id, instruction):
+        pass
+
+    def delete_chat(self, chat_id):
+        pass
+
+    def delete_project(self, project_id):
+        pass
 
     def upload(self, data, filename, content_type):
         return FileRef(id="f", url="u", name=filename, content_type=content_type)
-
-    def cleanup(self, *a):
-        pass
 
     def stream_turn(self, chat_id, model, prompt, **kw):
         self.stream_calls.append(prompt)
