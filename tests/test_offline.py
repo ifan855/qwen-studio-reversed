@@ -145,3 +145,39 @@ def test_punish_markers_include_x5sec():
     assert _looks_punished('window.location.replace(".../_____tmd_____/punish?x5secdata=Z")')
     assert _looks_punished('<meta name="aliyun_waf_aa" content="x">')
     assert not _looks_punished("hello world")
+
+
+def test_system_chat_context_always_dies_on_exit():
+    """A one-shot system chat is deleted (chat, then project) when the
+    block ends - even after several turns, and even if one delete fails."""
+    from qwen_studio import exceptions as qe
+    from qwen_studio.chats import Chat
+    from qwen_studio.projects import SystemChatContext
+
+    calls = []
+
+    class Svc:
+        def __init__(self, kind, fail_first=False):
+            self.kind, self.fail_first = kind, fail_first
+
+        def delete(self, rid):
+            calls.append((self.kind, rid))
+            if self.fail_first:
+                self.fail_first = False
+                raise qe.APIError("flaky")
+
+    class FakeClient:
+        chats = Svc("chat", fail_first=True)
+        projects = Svc("project")
+
+    ctx = SystemChatContext(client=FakeClient(), chat=Chat(id="c1"),
+                            project_id="p1")
+    with ctx as chat:
+        assert chat.id == "c1"
+    assert calls == [("chat", "c1"), ("chat", "c1"), ("project", "p1")]
+
+    calls.clear()
+    with SystemChatContext(client=FakeClient(), chat=Chat(id="c2"),
+                           project_id="p2", auto_cleanup=False):
+        pass
+    assert calls == []

@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from .chats import Chat
 from .client import QwenStudio
+from .exceptions import NotFoundError
 
 _log = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ class SystemChatContext:
     Proxies attribute access to the underlying
     :class:`~qwen_studio.chats.Chat` so callers can use ``chat.id``,
     ``chat.models``, etc. directly. On ``__exit__`` (when *auto_cleanup*
-    is ``True``), deletes the chat and then the project from the service.
+    is ``True``), always deletes the chat and then the project.
     """
 
     def __init__(self, *, client: QwenStudio, chat: Chat,
@@ -170,29 +171,30 @@ class SystemChatContext:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if not self._auto_cleanup:
-            return
-        # Only delete if the chat remained a true one-shot (<=1 user turn).
-        # If the caller sent additional messages the chat is now a cached
-        # session and must be preserved.
-        try:
-            msgs = self._client.chats.messages(self._chat.id)
-            user_turns = sum(1 for m in msgs if m.role == "user")
-        except Exception:  # noqa: BLE001
-            _log.debug("cleanup: could not inspect chat %s; skipping delete",
-                       self._chat.id, exc_info=True)
-            return
-        if user_turns > 1:
-            _log.debug("cleanup: chat %s has %d user turns; keeping project %s",
-                       self._chat.id, user_turns, self._project_id)
-            return
-        try:
-            self._client.chats.delete(self._chat.id)
-        except Exception:  # noqa: BLE001
-            _log.debug("cleanup: failed to delete chat %s", self._chat.id,
-                       exc_info=True)
-        try:
-            self._client.projects.delete(self._project_id)
-        except Exception:  # noqa: BLE001
-            _log.debug("cleanup: failed to delete project %s",
-                       self._project_id, exc_info=True)
+        if self._auto_cleanup:
+            self.close()
+
+    def close(self) -> None:
+        """Delete the chat, then the project - unconditionally.
+
+        A one-shot system chat dies when its ``with`` block ends, however
+        many turns it served (pass ``auto_cleanup=False`` to keep it). Both
+        deletions are attempted even if the first fails, and each is tried
+        twice before giving up with a warning, so no orphaned project is
+        left behind silently.
+        """
+        for kind, rid, delete in (
+                ("chat", self._chat.id, self._client.chats.delete),
+                ("project", self._project_id, self._client.projects.delete)):
+            if not rid:
+                continue
+            for attempt in (1, 2):
+                try:
+                    delete(rid)
+                    break
+                except NotFoundError:
+                    break                              # already gone
+                except Exception as e:  # noqa: BLE001
+                    if attempt == 2:
+                        _log.warning("cleanup: could not delete %s %s: %s",
+                                     kind, rid, e)

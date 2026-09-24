@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qwen-studio"
-version = "0.4.0"
+version = "0.4.1"
 description = "Reverse-engineered, live-verified Python client for the Qwen Studio (chat.qwen.ai) web API: chats, streaming, MCP tools, browser-session import, images, system prompts."
 readme = "README.md"
 requires-python = ">=3.9"

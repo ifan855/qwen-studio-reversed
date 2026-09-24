@@ -35,6 +35,7 @@ decisive discriminator).
 | `--api-key` | none | require `Authorization: Bearer <key>` from clients |
 | `--ttl` | 3600 | conversation memory window in seconds |
 | `--max-sessions` | 256 | LRU cap; evicted conversations are deleted upstream |
+| `--oneshot-ttl` | 60 | seconds before an idle *single-turn* conversation's chat + project are deleted upstream (history stays in memory); `-1` disables |
 | `--replay` | `both` | unseen-history mode: `both`/`file`/`inline` |
 | `--thinking` | off | enable Qwen thinking -> `reasoning_content` deltas |
 | `--default-model` | first catalogue entry | used when the client's model id is unknown |
@@ -67,31 +68,54 @@ appears on the wire; a token-obedience test through the proxy confirmed it.
 
 ### The 1-hour conversation memory and automatic routing
 
-Every served conversation's full OpenAI message history is kept in memory
-with a TTL (default 3600 s; `--ttl`). On each request the proxy
-canonicalises the incoming `messages` (role/content/tool_calls/tool_call_id,
-ignoring client decorations like `reasoning_content` or extra fields) and
-compares:
+Every served conversation is kept in memory with a TTL (default 3600 s;
+`--ttl`): its full OpenAI message history **plus the upstream project and
+chat it lives in**. On each request the proxy canonicalises the incoming
+`messages` and scores them against *every* stored conversation (not just
+the most recent one) - exact/retry beats continuation, a longer stored
+history beats a shorter one, an unchanged system prompt beats a changed
+one, recency breaks ties.
+
+Canonicalisation is deliberately lenient about what clients do when they
+echo our replies back: `developer` = `system`; `"text"` =
+`[{"type":"text","text":"text"}]`; `null` = `""`; CRLF and surrounding
+whitespace ignored; tool-call ids ignored (tool results are matched by
+position) and tool-call arguments compared as JSON values, not strings;
+`reasoning_content`, `name` and other decorations dropped.
 
 | incoming history | action |
 |---|---|
-| exact match of a stored history | re-serve the stored assistant reply (no upstream call), TTL reset |
-| exact match up to just before the stored reply (stateless client retry) | re-serve that reply, TTL reset |
-| stored history + new `user`/`tool` tail | **route to the same Qwen conversation**: only the new user turn is sent upstream, TTL reset |
-| anything else (rewound, edited, or never seen) | **replay mode** |
+| exact match of a stored history, or everything up to just before the stored reply (stateless retry) | re-serve the stored reply (no upstream call) |
+| stored history + anything new (user turn, **tool results**, client-added messages) | **continue in the same project + chat**: only the new messages go upstream, as one turn |
+| same dialog, different system prompt | the conversation's project instruction is updated in place, same chat continues (falls back to a new chat if that is impossible) |
+| shares a prefix, then diverges (edited / regenerated earlier turn) | **fork**: new chat in the *same project*, history replayed; the original conversation is untouched |
+| never seen | **replay mode** (below) |
+
+If a stored conversation's chat can no longer take a turn - it was reaped
+as a one-shot, deleted, or rejects the continuation (`NotFound` /
+`Bad_Request`), or failed twice in a row - the conversation is **revived**:
+a fresh chat is opened (in the same project when it still exists), the
+history is replayed into it, the dead chat is deleted, and from then on it
+continues natively again. Transient upstream states (rate limit, quota,
+anti-bot) never trigger this: they are surfaced so the client retries
+against the same chat.
+
+A continuation whose stream is interrupted (client disconnect, upstream
+error) no longer destroys the conversation: nothing is committed to
+memory, the chat is flagged, and the retry goes to the same chat with a
+short note that the cut-off reply never reached the user.
 
 ### Replay mode (unseen histories)
 
 A fresh Qwen conversation is created (inside a project when a system prompt
-is present, so system-prompt fidelity survives). The complete history -
-every message, tool call and tool result - is rendered into
+is present, so system-prompt fidelity survives). The history before the
+latest turn - every message, tool call and tool result - is rendered into
 `conversation-history.md`, uploaded through the file pipeline, and *also*
 inlined into the engineered prompt (mode `both`; `--replay file|inline`
-selects file-only / inline-only). The prompt tells Qwen to treat the file
-as its own memory and answer only the latest message. Verified live: a
-fabricated 3-turn history ("favourite colour teal, cat named Miso") was
-honoured exactly. If the file upload fails, the proxy falls back to
-inline-only automatically.
+selects file-only / inline-only). The latest turn (user message and/or tool
+results) follows it. Verified live: a fabricated 3-turn history
+("favourite colour teal, cat named Miso") was honoured exactly. If the file
+upload fails, the proxy falls back to inline-only automatically.
 
 ### Tools through MCP
 
@@ -99,12 +123,11 @@ OpenAI `tools` function definitions are declared to Qwen as client-side
 MCP (`local_mcp`) tools - the desktop app's mechanism. When the model
 invokes one, the proxy replies with standard OpenAI
 `finish_reason:"tool_calls"`; your client executes the tool and posts the
-`role:"tool"` result back. Because the upstream `role:"function"`
-continuation is server-gated (docs/local-tools.md), the tool-result turn is
-served through **replay mode**: the history document carries the calls and
-their results, and the tools are re-declared so the model can call them
-again. Verified live end-to-end: `get_vault_code` round-trip returned the
-tool result inside the final answer.
+`role:"tool"` result back. The upstream `role:"function"` continuation is
+server-gated (docs/local-tools.md), so the results are delivered to the
+**same chat** as the next turn (named after the calls that requested them,
+tools re-declared so the model can call again). If the chat rejects that
+turn, the conversation is revived through a replay automatically.
 
 ### File / image uploads
 
@@ -132,9 +155,17 @@ tool result inside the final answer.
   the connection is closed immediately - probing clients cannot leave
   half-read keep-alive sockets that reset and spam `ConnectionResetError`
   tracebacks. Routine disconnects are swallowed silently.
-- Expired/evicted conversations are deleted upstream (chats + project,
-  best effort); Ctrl-C cleans up everything still in memory.
-- Sessions dropped after upstream failures so retries rebuild cleanly.
+- **One-shot conversations die.** A conversation that never gets past its
+  first user turn (title/tag generators, autocomplete, single questions)
+  has its upstream chat **and project** deleted after `--oneshot-ttl`
+  seconds idle (default 60). Its history stays in memory for the full TTL,
+  so a late follow-up is still answered (the conversation is revived).
+  A first turn that is aborted or fails is deleted immediately.
+- Expired / evicted conversations are deleted upstream (chat, then the
+  project once no fork of the conversation still uses it).
+- Failed deletions are queued and retried by the sweeper (up to 5 tries)
+  instead of leaking; Ctrl-C (`service.shutdown()`) deletes everything
+  still held upstream.
 
 ## Client examples
 
