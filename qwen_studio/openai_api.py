@@ -492,6 +492,34 @@ class QwenBackend:
         yield {"type": "done", "response_id": response_id}
 
 
+class _OnceRelease:
+    """Release a lock at most once, whichever teardown path runs first.
+
+    A chat turn can finish in several ways (generator exhausted, closed by
+    the HTTP layer, finalised by the GC during exception unwinding, drained
+    by the non-streaming aggregator); several of them can observe the same
+    turn. Guarding the release keeps the *original* exception visible -
+    without it a failing upstream turn surfaced as
+    ``RuntimeError: cannot release un-acquired lock`` instead of the mapped
+    upstream error.
+    """
+
+    __slots__ = ("_lock", "_done")
+
+    def __init__(self, lock: threading.RLock) -> None:
+        self._lock = lock
+        self._done = False
+
+    def __call__(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        try:
+            self._lock.release()
+        except RuntimeError:      # pragma: no cover - defensive only
+            pass
+
+
 # ------------------------------------------------------------------- service
 @dataclass
 class Attachment:
@@ -593,26 +621,38 @@ class OpenAICompatService:
         self._lock.acquire()
         try:
             plan = self._plan(body)
-            if plan.mode == "cached":
-                self._lock.release()
-                return "json", plan.cached
-            gen = plan.gen
-            assert gen is not None
-
-            def guarded() -> Generator[Dict[str, Any], None, None]:
-                try:
-                    yield from gen
-                finally:
-                    self._lock.release()
-
-            if stream:
-                return "stream", guarded()
-            try:
-                return "json", aggregate_chunks(guarded())
-            except Exception:
-                raise
         except Exception:
             self._lock.release()
+            raise
+        if plan.mode == "cached":
+            try:
+                return "json", plan.cached
+            finally:
+                self._lock.release()
+        gen = plan.gen
+        assert gen is not None
+
+        # The lock must be released exactly once, by whichever of these gets
+        # there first: normal exhaustion, close() from the HTTP layer, the
+        # garbage collector finalising the generator while an upstream error
+        # unwinds, or the non-streaming drain below. A bare ``release()`` in
+        # both the generator's ``finally`` and the error path used to fire
+        # twice on any failing upstream turn, so the real error was replaced
+        # by ``RuntimeError: cannot release un-acquired lock``.
+        unlock = _OnceRelease(self._lock)
+
+        def guarded() -> Generator[Dict[str, Any], None, None]:
+            try:
+                yield from gen
+            finally:
+                unlock()
+
+        if stream:
+            return "stream", guarded()
+        try:
+            return "json", aggregate_chunks(guarded())
+        except Exception:
+            unlock()            # the generator may already have been finalised
             raise
 
     # ------------------------------------------------------------- planning
@@ -745,7 +785,7 @@ class OpenAICompatService:
             self._drop_session(sess)
             raise
         return Plan(mode="native", session=sess,
-                    gen=self._drive(sess, events, model, sess.views))
+                    gen=self._drive(sess, events, model, sess.views + tail))
 
     def _plan_new(self, views: List[Dict[str, Any]],
                   tools_decl: Dict[str, Any], body: Dict[str, Any]) -> Plan:
@@ -891,6 +931,14 @@ class OpenAICompatService:
                 "created": created, "model": model,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
                 "usage": _null_usage()}
+        # The request's history is authoritative for what this conversation
+        # now is: adopt it wholesale, then append the reply we just produced.
+        # Without this a *native* continuation left the new user turn out of
+        # the stored views, so the very next request no longer matched the
+        # stored prefix and silently fell back to the expensive replay path
+        # (fresh upstream chat + history upload) for every later turn.
+        sess.views = list(request_views)
+        sess.keys = keys_of(sess.views)
         self._finish(sess, view_message(msg), full)
 
     # ------------------------------------------------------------- streaming

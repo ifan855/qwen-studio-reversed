@@ -348,6 +348,89 @@ def test_upstream_failure_drops_session():
     assert len(be.created) >= 2                       # a fresh conversation
 
 
+def test_upstream_failure_mid_stream_keeps_the_real_error():
+    """A generator that blows up *while being drained* must surface its own
+    error, not a bogus 'cannot release un-acquired lock' from the lock being
+    released twice (generator finalised by the GC + the error path)."""
+    be = StubBackend()
+    svc = make_service(be)
+    orig = be.stream_turn
+
+    def boom(*a, **k):
+        yield {"type": "answer", "text": "partial"}
+        raise qe.APIError("upstream exploded", status=500)
+
+    be.stream_turn = boom
+    with pytest.raises(qe.APIError, match="upstream exploded"):
+        chat({"model": "m", "messages": [{"role": "user", "content": "a"}]}, svc)
+    # the service lock is free again: the next turn is served normally
+    be.stream_turn = orig
+    be.turns = [[{"type": "answer", "text": "fine"}]]
+    out = chat({"model": "m", "messages": [{"role": "user", "content": "b"}]}, svc)
+    assert out["choices"][0]["message"]["content"] == "fine"
+
+
+def test_upstream_failure_under_lock_does_not_wedge_the_service():
+    """Same failure, but observed through the HTTP mapping layer: the client
+    sees the mapped upstream status, never an internal lock error."""
+    be = StubBackend()
+    svc = make_service(be)
+
+    def boom(*a, **k):
+        yield {"type": "answer", "text": "partial"}
+        raise qe.QuotaError("quota exhausted")
+
+    be.stream_turn = boom
+    with pytest.raises(qe.QuotaError):
+        chat({"model": "m", "messages": [{"role": "user", "content": "a"}]}, svc)
+    assert map_exception(qe.QuotaError("q"))[0] == 429
+    assert not svc._lock._is_owned()          # nothing left holding the lock
+
+
+def test_native_continuation_keeps_routing_natively_for_later_turns():
+    """Turns after the first must keep extending the *same* upstream chat.
+
+    Regression: a native continuation did not record the new user turn, so
+    the stored history drifted from the client's by one message and every
+    later turn silently fell back to replay (new chat + history upload).
+    """
+    be = StubBackend(turns=[[{"type": "answer", "text": f"r{i}"}]
+                            for i in range(5)])
+    svc = make_service(be)
+    msgs = [{"role": "user", "content": "t1"}]
+    for turn in range(1, 5):
+        out = chat({"model": "m", "messages": msgs}, svc)
+        msgs = msgs + [out["choices"][0]["message"],
+                       {"role": "user", "content": f"t{turn + 1}"}]
+    assert [c[0] for c in be.stream_calls] == ["chat-1"] * 4   # one chat only
+    assert [c[2] for c in be.stream_calls] == ["t1", "t2", "t3", "t4"]
+    assert len(be.created) == 1                                # no replay
+    assert be.uploads == []                                    # no history file
+
+    # stored views mirror the client's history exactly (minus the last turn)
+    sess = next(iter(svc.router._sessions.values()))
+    assert [(v["role"], v["content"]) for v in sess.views] == [
+        (m["role"], m["content"]) for m in msgs[:-1]]
+
+
+def test_native_continuation_accepts_decorated_assistant_echo():
+    """Clients echo the assistant reply back with extra decorations
+    (reasoning_content, vendor fields); those are not part of a message's
+    identity, so routing must stay native anyway."""
+    be = StubBackend(turns=[[{"type": "answer", "text": "A"}],
+                            [{"type": "answer", "text": "B"}]])
+    svc = make_service(be)
+    chat({"model": "m", "messages": [{"role": "user", "content": "hi"}]}, svc)
+    decorated = {"role": "assistant", "content": "A",
+                 "reasoning_content": "hmm",
+                 "refusal": None, "annotations": []}
+    chat({"model": "m", "messages": [
+        {"role": "user", "content": "hi"}, decorated,
+        {"role": "user", "content": "more"}]}, svc)
+    assert [c[0] for c in be.stream_calls] == ["chat-1", "chat-1"]
+    assert be.uploads == []
+
+
 # ----------------------------------------------------------------- helpers
 def test_aggregate_chunks_content_and_tools():
     chunks = [

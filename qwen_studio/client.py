@@ -33,7 +33,10 @@ import json
 import time
 import uuid
 import warnings
-from typing import Any, Dict, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional
+
+if TYPE_CHECKING:  # annotation-only import (keeps the sse module optional)
+    from .sse import ChatEvent
 
 try:  # optional fallback transport; curl_cffi is the supported default
     import requests

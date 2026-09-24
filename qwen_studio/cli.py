@@ -121,8 +121,19 @@ def _build_client(args: argparse.Namespace):
     path = os.path.abspath(args.auth_file)
     auth: Dict[str, Any] = {}
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            auth = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                auth = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"error: cannot read the auth file {path}: {e}.\n"
+                  f"run `qwen-studio login` again to regenerate it (or pass "
+                  f"--auth-file / QWEN_EMAIL+QWEN_PASSWORD).", file=sys.stderr)
+            raise SystemExit(2)
+        if not isinstance(auth, dict):
+            print(f"error: the auth file {path} does not contain a JSON "
+                  f"object; run `qwen-studio login` again to regenerate it.",
+                  file=sys.stderr)
+            raise SystemExit(2)
     elif not (email and password):
         print(f"error: no auth file at {path} and no --email/--password.\n"
               f"run `qwen-studio login` in this directory first (or pass "
@@ -176,8 +187,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
         backend, ttl=args.ttl, max_sessions=args.max_sessions,
         replay_mode=args.replay, thinking=args.thinking)
     service.start_sweeper()
-    server = OpenAIProxyServer((args.host, args.port), service,
-                               api_key=args.api_key)
+    try:
+        server = OpenAIProxyServer((args.host, args.port), service,
+                                   api_key=args.api_key)
+    except OSError as e:  # port taken / host not resolvable / no permission
+        service.stop_sweeper()
+        print(f"error: cannot bind {args.host}:{args.port} ({e}).\n"
+              f"another process is probably already listening there; pass "
+              f"--port (and --host) to serve somewhere else.",
+              file=sys.stderr)
+        return 2
 
     print(f"OpenAI-compatible API on http://{args.host}:{args.port}/v1")
     print(f"  history memory   : {int(args.ttl)}s TTL, "

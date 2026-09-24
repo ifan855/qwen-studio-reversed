@@ -245,6 +245,17 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode())
             except Exception:  # noqa: BLE001
                 return
+        finally:
+            # Close the chunk generator explicitly: it owns the service lock,
+            # so relying on refcount-driven finalisation risks holding the
+            # lock when a client disconnects mid-stream (every later request
+            # would then block until the GC happened to run).
+            close = getattr(chunks, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - teardown must not mask
+                    pass
         try:
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
