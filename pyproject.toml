@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-studio"
+version = "0.4.0"
+description = "Reverse-engineered, live-verified Python client for the Qwen Studio (chat.qwen.ai) web API: chats, streaming, MCP tools, browser-session import, images, system prompts."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "protocol study" }]
+keywords = ["qwen", "chat", "mcp", "reverse-engineering", "sse", "api-client",
+            "cookies", "curl_cffi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "curl_cffi>=0.7",        # Chrome TLS/HTTP2 fingerprint transport (default + required)
+    "cryptography>=42",      # Chrome-family cookie-store decryption
+]
+
+[project.scripts]
+qwen-studio = "qwen_studio.cli:main"
+
+[project.optional-dependencies]
+keyring = ["secretstorage>=3.2"]   # libsecret lookup for Chrome-family 'Safe Storage' keys
+fallback = ["requests>=2.28"]      # plain-requests fallback (impersonate=None) - not recommended
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["qwen_studio*"]
