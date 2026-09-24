@@ -136,6 +136,7 @@ class LocalToolSession:
         self.chat_id = chat_id
         self.server_name = server_name
         self._tools: Dict[str, Tool] = {}
+        self._parent_id: Optional[str] = None
 
     # ------------------------------------------------------------ registry
     def register(self, fn_or_name: Any, fn: Optional[Callable[..., Any]] = None,
@@ -172,22 +173,26 @@ class LocalToolSession:
                       thinking_mode="Enable")
         fc["local_mcp"] = self.declaration()
         msg = {
-            "id": None, "fid": str(uuid.uuid4()), "parentId": None,
+            "id": None, "fid": str(uuid.uuid4()),
+            "parentId": self._parent_id,
             "childrenIds": [str(uuid.uuid4())], "role": "user",
             "content": prompt, "user_action": "chat", "files": [],
             "timestamp": int(time.time()), "models": [model], "model": "",
             "chat_type": "t2t", "feature_config": fc,
             "extra": {"meta": {"subChatType": "t2t"}},
-            "sub_chat_type": "t2t", "parent_id": None,
+            "sub_chat_type": "t2t", "parent_id": self._parent_id,
         }
         body = {
             "stream": True, "version": "2.1", "incremental_output": True,
-            "chatId": self.chat_id, "parentId": "", "chat_id": self.chat_id,
-            "chat_mode": "normal", "model": model, "parent_id": None,
+            "chatId": self.chat_id, "parentId": self._parent_id or "",
+            "chat_id": self.chat_id, "chat_mode": "normal", "model": model,
+            "parent_id": self._parent_id,
             "messages": [msg], "timestamp": int(time.time()),
         }
-        return self.client.stream_completion(body, self.chat_id,
-                                             keep_events=keep_events)
+        result = self.client.stream_completion(body, self.chat_id,
+                                               keep_events=keep_events)
+        self._parent_id = getattr(result, "response_id", None) or self._parent_id
+        return result
 
     # ------------------------------------------------------------- execute
     def execute_calls(self, tool_calls: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, str]]]:
@@ -233,12 +238,16 @@ class LocalToolSession:
         fc = {k: v for k, v in DEFAULT_FEATURE_CONFIG.items()
               if k not in ("mcp", "local_mcp")}
         fn_msg = {
-            "fid": response_id, "childrenIds": [], "role": "function",
+            # This is a NEW message-tree node. Reusing the tool-emitting
+            # response fid makes Qwen treat the continuation as an edit of
+            # that node, which can hide the original user turn from context.
+            "fid": str(uuid.uuid4()), "childrenIds": [], "role": "function",
             "content": content, "files": [], "timestamp": int(time.time()),
             "models": [model], "model": "", "chat_type": "t2t",
             "feature_config": fc,
             "extra": {"meta": {"subChatType": "t2t"}, "mcp_results": results},
-            "sub_chat_type": "t2t", "parent_id": None, "parentId": None,
+            "sub_chat_type": "t2t",
+            "parent_id": response_id, "parentId": response_id,
         }
         body = {
             "stream": True, "version": "2.1", "incremental_output": True,
@@ -248,7 +257,9 @@ class LocalToolSession:
             "timestamp": int(time.time()),
         }
         try:
-            return self.client.stream_completion(body, self.chat_id)
+            result = self.client.stream_completion(body, self.chat_id)
+            self._parent_id = getattr(result, "response_id", None) or self._parent_id
+            return result
         except PunishedError as e:
             raise ContinuationBlockedError(
                 "tool-result continuation hit the anti-bot risk engine "

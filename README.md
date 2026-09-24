@@ -21,7 +21,7 @@ qwen-studio serve --port 8080 --api-key sk-my-secret
 #   system prompts (server-side enforced), tools via the MCP wrap,
 #   image/file uploads, 1-hour in-memory conversation history: follow-ups
 #   continue in the same Qwen project + chat, unseen histories are replayed,
-#   one-shot conversations are deleted upstream after 60 s idle.
+#   one-shot conversations can be explicitly reaped early after completion; by default the upstream chat/project live for the full session TTL.
 ```
 
 Any OpenAI client works: `OpenAI(base_url="http://127.0.0.1:8080/v1")`.

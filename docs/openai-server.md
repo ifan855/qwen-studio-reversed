@@ -122,13 +122,19 @@ upload fails, the proxy falls back to inline-only automatically.
 ### Tools through MCP
 
 OpenAI `tools` function definitions are declared to Qwen as client-side
-MCP (`local_mcp`) tools - the desktop app's mechanism. When the model
+MCP (`local_mcp`) tools - the desktop app's native tool mechanism. The proxy
+keeps those native declarations on the conversation session and re-supplies
+them on follow-up turns even when an OpenAI client omits `tools` from a
+subsequent request. When the model
 invokes one, the proxy replies with standard OpenAI
 `finish_reason:"tool_calls"`; your client executes the tool and posts the
-`role:"tool"` result back. The upstream `role:"function"` continuation is
-server-gated (docs/local-tools.md), so the results are delivered to the
-**same chat** as the next turn (named after the calls that requested them,
-tools re-declared so the model can call again). If the chat rejects that
+`role:"tool"` result back. The upstream conversation is also linked with the previous Qwen response
+node id on every native continuation, so new messages are appended to the
+same server-side tree rather than treated as edits. The upstream
+`role:"function"` continuation remains subject to the server gate described
+in docs/local-tools.md; for the OpenAI proxy, tool requests are exposed as
+standard `tool_calls` while the native `local_mcp` declaration stays attached
+to the Qwen turn. If the chat rejects that
 turn, the conversation is revived through a replay automatically.
 
 ### File / image uploads

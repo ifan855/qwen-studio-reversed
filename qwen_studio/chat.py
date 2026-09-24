@@ -59,6 +59,7 @@ class ChatCompletion:
     @staticmethod
     def user_message(content: str, model: str, *, feature_config: Dict[str, Any],
                      fid: Optional[str] = None,
+                     parent_id: Optional[str] = None,
                      files: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """The user message node exactly as the web client serialises it.
 
@@ -70,7 +71,7 @@ class ChatCompletion:
         return {
             "id": None,
             "fid": fid,
-            "parentId": None,
+            "parentId": parent_id,
             "childrenIds": [str(uuid.uuid4())],
             "role": "user",
             "content": content,
@@ -83,7 +84,7 @@ class ChatCompletion:
             "feature_config": feature_config,
             "extra": {"meta": {"subChatType": "t2t"}},
             "sub_chat_type": "t2t",
-            "parent_id": None,
+            "parent_id": parent_id,
         }
 
     @staticmethod
@@ -108,6 +109,7 @@ class ChatCompletion:
 
     # ------------------------------------------------------------------ send
     def send(self, chat_id: str, prompt: str, model: str, *,
+             parent_id: Optional[str] = None,
              mcp_enabled: bool = False, thinking: bool = False,
              files: Optional[List[Dict[str, Any]]] = None,
              extra_feature_config: Optional[Dict[str, Any]] = None,
@@ -121,6 +123,10 @@ class ChatCompletion:
             model: model id from :meth:`QwenStudio.list_model_ids` - ids
                 rotate, do not hardcode. Vision inputs need a
                 vision-capable model (``omni``/``vl`` in the catalogue).
+            parent_id: upstream response/node id this message continues.
+                Leave unset for the first turn; the server-side chat tree uses
+                this linkage to append a real child turn instead of treating
+                the request like an edit.
             mcp_enabled: attach the ``local_mcp: {}`` marker so the backend
                 applies this account's *hosted* MCP servers (enable them
                 first via :class:`~qwen_studio.tools.MCPService`).
@@ -139,8 +145,9 @@ class ChatCompletion:
         if extra_feature_config:
             fc.update(extra_feature_config)
 
-        msg = self.user_message(prompt, model, feature_config=fc, files=files)
-        body = self.build_body(chat_id, [msg], model)
+        msg = self.user_message(prompt, model, feature_config=fc,
+                                parent_id=parent_id, files=files)
+        body = self.build_body(chat_id, [msg], model, parent_id=parent_id)
         result = self.client.stream_completion(body, chat_id, keep_events=keep_events)
         return Turn(chat_id=chat_id, response_id=result.response_id, result=result)
 

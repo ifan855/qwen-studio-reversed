@@ -109,4 +109,6 @@ print(res2.answer)
 ```
 
 `session.tool` also works as a decorator for inline registration, and
-`register("alias_name", fn)` lets you rename a tool for the model.
+`register("alias_name", fn)` lets you rename a tool for the model. The session
+tracks the last upstream response id, so subsequent `send()` calls are linked
+as real child turns instead of edits.

@@ -28,7 +28,7 @@ class StubBackend:
 
     def __init__(self, turns=None, models=None):
         self.turns = list(turns or [])          # one event-list per stream_turn
-        self.stream_calls = []                  # (chat_id, model, prompt, files, tools)
+        self.stream_calls = []                  # (chat_id, model, prompt, files, tools, parent_id)
         self.created = []                       # (model, system)
         self.uploads = []                       # (filename, ct)
         self.cleaned = []                       # (chat_ids, project_id)
@@ -98,9 +98,9 @@ class StubBackend:
                        name=filename, content_type=content_type)
 
     def stream_turn(self, chat_id, model, prompt, *, files_entries=None,
-                    tools_decl=None, thinking=False):
+                    tools_decl=None, thinking=False, parent_id=None):
         self.stream_calls.append((chat_id, model, prompt, files_entries,
-                                  tools_decl))
+                                  tools_decl, parent_id))
         events = self.turns.pop(0) if self.turns else [
             {"type": "answer", "text": "stub"}]
         yield from events
@@ -289,6 +289,21 @@ def test_service_exact_resend_is_cached():
     assert be.created and len(be.created) == 1
 
 
+def test_service_continuation_links_to_previous_upstream_response():
+    be = StubBackend(turns=[
+        [{"type": "created", "response_id": "up-1"}, {"type": "answer", "text": "A"}],
+        [{"type": "created", "response_id": "up-2"}, {"type": "answer", "text": "B"}],
+    ])
+    svc = make_service(be)
+    m1 = [{"role": "user", "content": "first"}]
+    m2 = m1 + [{"role": "assistant", "content": "A"},
+              {"role": "user", "content": "second"}]
+    chat({"model": "m", "messages": m1}, svc)
+    chat({"model": "m", "messages": m2}, svc)
+    assert be.stream_calls[0][5] is None
+    assert be.stream_calls[1][5] == "up-1"
+
+
 def test_service_continuation_routes_to_same_chat():
     be = StubBackend(turns=[[{"type": "answer", "text": "A"}],
                             [{"type": "answer", "text": "B"}]])
@@ -319,6 +334,65 @@ def test_service_unseen_history_replays_with_history_file():
     assert "Latest user message:" in prompt
     # the replay chat is a brand new conversation inside the project
     assert be.created[0][1] == "S"
+
+
+def test_local_tool_session_chains_new_user_turn_from_last_response():
+    from qwen_studio.local_tools import LocalToolSession
+
+    class Result:
+        def __init__(self, response_id): self.response_id = response_id
+
+    class Client:
+        def __init__(self): self.bodies = []
+        def stream_completion(self, body, chat_id, **kw):
+            self.bodies.append(body)
+            return Result(f"resp-{len(self.bodies)}")
+
+    client = Client()
+    session = LocalToolSession(client, "chat-1")
+    session.send("first", "m")
+    session.send("second", "m")
+    assert client.bodies[0]["parentId"] == "" and client.bodies[0]["parent_id"] is None
+    assert client.bodies[1]["parentId"] == "resp-1" and client.bodies[1]["parent_id"] == "resp-1"
+    assert client.bodies[1]["messages"][0]["parentId"] == "resp-1"
+
+
+def test_local_tool_result_is_a_new_child_message():
+    from qwen_studio.local_tools import LocalToolSession
+
+    class Client:
+        def __init__(self): self.body = None
+        def stream_completion(self, body, chat_id):
+            self.body = body
+            return type("R", (), {})()
+
+    client = Client()
+    session = LocalToolSession(client, "chat-1")
+    session.send_tool_results("m", "up-1", {"openai_tools": []})
+    msg = client.body["messages"][0]
+    assert msg["role"] == "function"
+    assert msg["fid"] != "up-1"
+    assert msg["parentId"] == "up-1" and msg["parent_id"] == "up-1"
+    assert client.body["parentId"] == "up-1" and client.body["parent_id"] == "up-1"
+
+
+def test_native_mcp_declaration_survives_follow_up_without_tools_field():
+    be = StubBackend(turns=[
+        [{"type": "created", "response_id": "up-1"}, {"type": "answer", "text": "A"}],
+        [{"type": "created", "response_id": "up-2"}, {"type": "answer", "text": "B"}],
+    ])
+    svc = make_service(be)
+    tools = [{"type": "function", "function": {
+        "name": "lookup", "description": "Lookup",
+        "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}]
+    m1 = [{"role": "user", "content": "look this up"}]
+    m2 = m1 + [{"role": "assistant", "content": "A"},
+              {"role": "user", "content": "continue"}]
+    chat({"model": "m", "messages": m1, "tools": tools}, svc)
+    chat({"model": "m", "messages": m2}, svc)
+    assert be.stream_calls[0][4]["openai_tools"]["lookup"]
+    assert be.stream_calls[1][4]["openai_tools"]["lookup"]
+    assert be.stream_calls[1][5] == "up-1"
 
 
 def test_service_tool_roundtrip_stays_in_same_chat():
@@ -374,7 +448,7 @@ def test_tool_results_plus_user_message_are_both_delivered():
                {"role": "tool", "tool_call_id": cid, "content": "RESULT-7"},
                {"role": "user", "content": "also say hi"}]
     chat({"model": "m", "messages": m2}, svc)
-    chat_id, _, prompt, _, _ = be.stream_calls[1]
+    chat_id, _, prompt, _, _, _ = be.stream_calls[1]
     assert chat_id == "chat-1"
     assert "RESULT-7" in prompt and "also say hi" in prompt
     assert prompt.index("RESULT-7") < prompt.index("also say hi")
@@ -391,7 +465,7 @@ def test_service_image_part_uploads_and_picks_vision_model():
             {"type": "text", "text": "what is this?"},
             {"type": "image_url", "image_url": {"url": png}}]}]}, svc)
     assert out["choices"][0]["message"]["content"] == "seen"
-    _, model, prompt, files, _ = be.stream_calls[0]
+    _, model, prompt, files, _, _ = be.stream_calls[0]
     assert "vl" in model                                   # vision routing
     assert files and files[0]["file_class"] == "vision"
     assert "what is this?" in prompt

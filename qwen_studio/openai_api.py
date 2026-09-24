@@ -319,6 +319,8 @@ class Session:
     last_assistant: Optional[Dict[str, Any]] = None     # full re-servable reply
     upstream_turns: int = 0          # turns served in the current chat
     interrupted: bool = False        # current chat holds an undelivered reply
+    upstream_parent_id: Optional[str] = None  # last committed Qwen response node
+    tools_decl: Dict[str, Any] = field(default_factory=dict)  # native local_mcp schemas
     failures: int = 0                # consecutive failed turns in this chat
     created_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
@@ -755,7 +757,8 @@ class QwenBackend:
     def stream_turn(self, chat_id: str, model: str, prompt: str, *,
                     files_entries: Optional[List[Dict[str, Any]]] = None,
                     tools_decl: Optional[Dict[str, Any]] = None,
-                    thinking: bool = False) -> Generator[Dict[str, Any], None, None]:
+                    thinking: bool = False,
+                    parent_id: Optional[str] = None) -> Generator[Dict[str, Any], None, None]:
         """One user turn -> normalised upstream events:
 
         ``{"type":"created"|"answer"|"thinking"|"tool_call"|"done", ...}``
@@ -767,8 +770,10 @@ class QwenBackend:
         if tools_decl:
             fc["local_mcp"] = tools_decl
         msg = ChatCompletion.user_message(prompt, model, feature_config=fc,
+                                          parent_id=parent_id,
                                           files=files_entries or [])
-        body = ChatCompletion.build_body(chat_id, [msg], model)
+        body = ChatCompletion.build_body(chat_id, [msg], model,
+                                         parent_id=parent_id)
         response_id = None
         for ev in self.q.stream_events(body, chat_id):
             if ev.type == "created":
@@ -1039,6 +1044,8 @@ class OpenAICompatService:
         sess.chat_id = None
         sess.project = None
         sess.upstream_turns = 0
+        sess.upstream_parent_id = None
+        sess.tools_decl = {}
         sess.interrupted = False
         sess.failures = 0
         sess.completed_at = None
@@ -1114,7 +1121,9 @@ class OpenAICompatService:
                  decision.mode,
                  f" [{sess.id[:8]} chat={sess.chat_id}]" if sess else "",
                  len(views), len(self.router))
-        tools_decl = self.backend.declare_tools(body.get("tools") or [])
+        tools_present = "tools" in body
+        tools_decl = (self.backend.declare_tools(body.get("tools") or [])
+                      if tools_present else {})
         if decision.mode == "cached":
             assert sess is not None
             self.router.touch(sess)
@@ -1122,13 +1131,15 @@ class OpenAICompatService:
                         cached=dict(sess.last_assistant or {}))
         if decision.mode == "native":
             assert sess is not None
+            effective_tools = tools_decl if tools_present else sess.tools_decl
             if sess.dormant or sess.failures >= 2:
-                return self._plan_open(views, tools_decl, body, mode="revive",
+                return self._plan_open(views, effective_tools, body, mode="revive",
                                        session=sess, reuse_project=sess.project)
-            return self._plan_native(sess, views, decision, tools_decl, body)
+            return self._plan_native(sess, views, decision, effective_tools, body)
         if decision.mode == "fork":
             assert sess is not None
-            return self._plan_open(views, tools_decl, body, mode="fork",
+            effective_tools = tools_decl if tools_present else sess.tools_decl
+            return self._plan_open(views, effective_tools, body, mode="fork",
                                    reuse_project=sess.project)
         return self._plan_open(views, tools_decl, body, mode=decision.mode)
 
@@ -1258,7 +1269,8 @@ class OpenAICompatService:
         try:
             events = _prime(self.backend.stream_turn(
                 sess.chat_id, model, prompt, files_entries=entries,
-                tools_decl=tools_decl, thinking=self.thinking))
+                tools_decl=tools_decl, thinking=self.thinking,
+                parent_id=sess.upstream_parent_id))
         except CHAT_BROKEN_ERRORS as e:
             # the chat itself rejected the turn (deleted, broken, gated):
             # carry the conversation over into a fresh chat, same project
@@ -1275,12 +1287,15 @@ class OpenAICompatService:
             sess.failures += 1
             raise
 
-        def commit(assistant_view: Dict[str, Any], full: Dict[str, Any]) -> None:
+        def commit(assistant_view: Dict[str, Any], full: Dict[str, Any],
+                   upstream_parent_id: Optional[str]) -> None:
             sess.set_history(views + [assistant_view])
             sess.last_assistant = full
             sess.model = model
             sess.upstream_turns += 1
             sess.interrupted = False
+            sess.upstream_parent_id = upstream_parent_id
+            sess.tools_decl = dict(tools_decl)
             sess.failures = 0
             sess.completed_at = time.time()
             self.router.touch(sess)
@@ -1358,13 +1373,16 @@ class OpenAICompatService:
 
         sess = session if session is not None else Session(id=uuid.uuid4().hex)
 
-        def commit(assistant_view: Dict[str, Any], full: Dict[str, Any]) -> None:
+        def commit(assistant_view: Dict[str, Any], full: Dict[str, Any],
+                   upstream_parent_id: Optional[str]) -> None:
             if sess.chat_id or sess.project:
                 self._release_upstream(sess)     # the chat we moved away from
             sess.chat_id = chat_id
             sess.project = project
             sess.upstream_turns = 1
             sess.interrupted = False
+            sess.upstream_parent_id = upstream_parent_id
+            sess.tools_decl = dict(tools_decl)
             sess.failures = 0
             sess.completed_at = time.time()
             sess.set_history(views + [assistant_view])
@@ -1384,7 +1402,7 @@ class OpenAICompatService:
 
     # ------------------------------------------------------------- draining
     def _drive(self, events: Iterator[Dict[str, Any]], model: str,
-               on_commit: Callable[[Dict[str, Any], Dict[str, Any]], None],
+               on_commit: Callable[[Dict[str, Any], Dict[str, Any], Optional[str]], None],
                on_abort: Callable[[Optional[BaseException]], None]
                ) -> Generator[Dict[str, Any], None, None]:
         """Consume upstream events, emit OpenAI chunk dicts, then commit.
@@ -1398,10 +1416,14 @@ class OpenAICompatService:
         answer: List[str] = []
         think: List[str] = []
         calls: List[Dict[str, Any]] = []
+        upstream_parent_id: Optional[str] = None
         first = True
         finish = "stop"
         try:
             for ev in events:
+                if ev["type"] == "created":
+                    upstream_parent_id = ev.get("response_id") or upstream_parent_id
+                    continue
                 if ev["type"] == "answer":
                     answer.append(ev["text"])
                     yield _chunk(reply_id, created, model,
@@ -1448,7 +1470,7 @@ class OpenAICompatService:
                 "created": created, "model": model,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
                 "usage": _null_usage()}
-        on_commit(view_message(msg), full)
+        on_commit(view_message(msg), full, upstream_parent_id)
 
     # ------------------------------------------------------------- streaming
     def stream_cached(self, full: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
