@@ -20,11 +20,14 @@ response inspection during the study).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .chats import Chat
 from .client import QwenStudio
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -106,16 +109,90 @@ class ProjectService:
         return [Chat.from_api(x) for x in items if isinstance(x, dict)]
 
     # ------------------------------------------------------------ high level
-    def system_chat(self, model: str, instruction: str, *, name: str = "") -> Any:
+    def system_chat(self, model: str, instruction: str, *, name: str = "",
+                    auto_cleanup: bool = True) -> "SystemChatContext":
         """One-call system prompt: create a project carrying
-        ``instruction``, then a chat inside it. Returns the chat.
+        ``instruction``, then a chat inside it.
 
-        Every turn sent to the returned chat (``q.chat.send``) runs under
-        the instruction - invisible on the wire, enforced server-side.
-        Clean up with ``q.chats.delete`` + ``q.projects.delete``.
+        Returns a :class:`SystemChatContext` that proxies attribute access
+        to the underlying :class:`~qwen_studio.chats.Chat` (so ``chat.id``,
+        ``chat.models`` etc. work transparently).
+
+        When *auto_cleanup* is ``True`` (the default), the project **and**
+        its chat are deleted from the web service when the context exits::
+
+            with q.projects.system_chat("qwen-max", "Reply in haiku") as chat:
+                print(q.chat.ask(chat.id, "Hello", "qwen-max"))
+            # project + chat gone from chat.qwen.ai
+
+        Set ``auto_cleanup=False`` to keep them (legacy behaviour).
         """
         name = name or f"prompt-{instruction[:24].strip()}"
         proj = self.create(name, custom_instruction=instruction)
         chat = self.client.chats.create(model, project_id=proj.id)
         chat.raw["project_id"] = proj.id  # carry for cleanup symmetry
-        return chat
+        return SystemChatContext(
+            client=self.client, chat=chat, project_id=proj.id,
+            auto_cleanup=auto_cleanup)
+
+
+class SystemChatContext:
+    """Context manager wrapping a one-shot system-prompt chat.
+
+    Proxies attribute access to the underlying
+    :class:`~qwen_studio.chats.Chat` so callers can use ``chat.id``,
+    ``chat.models``, etc. directly. On ``__exit__`` (when *auto_cleanup*
+    is ``True``), deletes the chat and then the project from the service.
+    """
+
+    def __init__(self, *, client: QwenStudio, chat: Chat,
+                 project_id: str, auto_cleanup: bool = True) -> None:
+        self._client = client
+        self._chat = chat
+        self._project_id = project_id
+        self._auto_cleanup = auto_cleanup
+
+    # -- proxy Chat attributes ------------------------------------------
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._chat, name)
+
+    @property
+    def chat(self) -> Chat:
+        """The underlying :class:`~qwen_studio.chats.Chat`."""
+        return self._chat
+
+    @property
+    def project_id(self) -> str:
+        return self._project_id
+
+    # -- context manager ------------------------------------------------
+    def __enter__(self) -> "SystemChatContext":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if not self._auto_cleanup:
+            return
+        # Only delete if the chat remained a true one-shot (<=1 user turn).
+        # If the caller sent additional messages the chat is now a cached
+        # session and must be preserved.
+        try:
+            msgs = self._client.chats.messages(self._chat.id)
+            user_turns = sum(1 for m in msgs if m.role == "user")
+        except Exception:  # noqa: BLE001
+            _log.debug("cleanup: could not inspect chat %s; skipping delete",
+                       self._chat.id, exc_info=True)
+            return
+        if user_turns > 1:
+            _log.debug("cleanup: chat %s has %d user turns; keeping project %s",
+                       self._chat.id, user_turns, self._project_id)
+            return
+        try:
+            self._client.chats.delete(self._chat.id)
+        except Exception:  # noqa: BLE001
+            _log.debug("cleanup: failed to delete chat %s", self._chat.id,
+                       exc_info=True)
+        try:
+            self._client.projects.delete(self._project_id)
+        except Exception:  # noqa: BLE001
+            _log.debug("cleanup: failed to delete project %s",
+                       self._project_id, exc_info=True)
