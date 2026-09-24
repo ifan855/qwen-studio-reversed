@@ -12,6 +12,11 @@ Pure standard library (``http.server``) - no extra dependencies. Endpoints:
 - ``GET  /v1/files`` / ``GET /v1/files/{id}`` - list / inspect uploads.
 - ``GET  /health`` - liveness.
 
+The proxy speaks plain HTTP + SSE.  Websocket handshakes (e.g. ``GET /ws``)
+are answered with a clean JSON 404 and the connection is closed, so probing
+clients cannot leave half-read keep-alive sockets that reset and spam
+tracebacks; routine connection resets are swallowed silently.
+
 Errors are returned as OpenAI error objects; upstream punish/quota states
 map to 503/429 so standard OpenAI SDK retry logic behaves.
 """
@@ -19,11 +24,19 @@ map to 503/429 so standard OpenAI SDK retry logic behaves.
 from __future__ import annotations
 
 import json
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 
 from . import exceptions as exc
 from .openai_api import OpenAICompatService
+
+# Routine socket-level events: clients that vanish mid-request, probe a
+# websocket handshake at /ws and then drop the connection, time out, etc.
+# These must never surface as server tracebacks.
+CONNECTION_ERRORS = (BrokenPipeError, ConnectionResetError,
+                     ConnectionAbortedError, TimeoutError,
+                     ConnectionRefusedError)
 
 
 def error_object(message: str, type_: str = "api_error",
@@ -103,8 +116,50 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------- plumbing
     def log_message(self, fmt: str, *args: Any) -> None:
-        import sys
         sys.stderr.write("[proxy] %s %s\n" % (self.address_string(), fmt % args))
+
+    def handle(self) -> None:
+        """Serve one connection; silent on routine disconnects."""
+        try:
+            super().handle()
+        except CONNECTION_ERRORS:
+            self.close_connection = True
+
+    def _wants_upgrade(self) -> bool:
+        """True for websocket handshakes and /ws probes."""
+        if self.headers.get("Upgrade"):
+            return True
+        path = self.path.split("?")[0].rstrip("/") or "/"
+        return path in ("/ws", "/socket.io", "/ws/socket.io")
+
+    def _reject_upgrade(self) -> None:
+        """Answer a websocket attempt cleanly - and *close* the socket.
+
+        This proxy is HTTP + SSE only.  A websocket client aborts the TCP
+        connection as soon as it sees a non-101 reply; if we kept the
+        connection alive, the follow-up request read would die with
+        ``ConnectionResetError`` and spam socketserver tracebacks.  One
+        clean response, one closed connection.
+        """
+        path = self.path.split("?")[0]
+        blob = json.dumps(error_object(
+            f"{path} is not a websocket endpoint; this proxy is HTTP-only. "
+            "Stream chat via POST /v1/chat/completions with "
+            "\"stream\": true (server-sent events), or use the other "
+            "/v1 REST endpoints.", "invalid_request_error",
+            "websocket_not_supported"), ensure_ascii=False).encode("utf-8")
+        self.close_connection = True
+        try:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Connection", "close")
+            self._cors()
+            self.end_headers()
+            self.wfile.write(blob)
+            self.wfile.flush()
+        except CONNECTION_ERRORS:
+            self.close_connection = True
 
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -145,12 +200,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
     # --------------------------------------------------------------- routes
     def do_OPTIONS(self) -> None:  # noqa: N802
+        if self._wants_upgrade():
+            return self._reject_upgrade()
         self.send_response(204)
         self._cors()
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
+        if self._wants_upgrade():
+            return self._reject_upgrade()
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path == "/health":
             return self._json_send(200, {"ok": True,
@@ -173,6 +232,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     return self._json_send(404, error_object(f"no file {fid}",
                                                              "not_found"))
                 return self._json_send(200, meta)
+        except CONNECTION_ERRORS:
+            self.close_connection = True
+            return
         except Exception as e:  # noqa: BLE001
             status, payload = map_exception(e)
             return self._json_send(status, payload)
@@ -180,6 +242,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                                                  "not_found"))
 
     def do_POST(self) -> None:  # noqa: N802
+        if self._wants_upgrade():
+            return self._reject_upgrade()
         path = self.path.split("?")[0].rstrip("/") or "/"
         if not self._authorized():
             return self._json_send(401, error_object("invalid api key",
@@ -189,7 +253,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 return self._chat_completions()
             if path in ("/v1/files", "/files"):
                 return self._upload_file()
-        except BrokenPipeError:
+        except CONNECTION_ERRORS:
             self.close_connection = True
             return
         except Exception as e:  # noqa: BLE001
@@ -230,12 +294,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
         self.close_connection = True
+        send_done = False
         try:
             for ch in chunks:
                 self.wfile.write(
                     f"data: {json.dumps(ch, ensure_ascii=False)}\n\n".encode())
                 self.wfile.flush()
-        except BrokenPipeError:
+            send_done = True
+        except CONNECTION_ERRORS:
+            # client vanished mid-stream: unwind cleanly so the service
+            # releases its lock and forgets the half-built conversation
             self.close_connection = True
             return
         except Exception as e:  # noqa: BLE001 - mid-stream failure
@@ -243,13 +311,22 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 _, err = map_exception(e)
                 self.wfile.write(
                     f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode())
+                send_done = True
             except Exception:  # noqa: BLE001
                 return
-        try:
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except Exception:  # noqa: BLE001
-            pass
+        finally:
+            close = getattr(chunks, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
+        if send_done:
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class OpenAIProxyServer(ThreadingHTTPServer):
@@ -261,6 +338,15 @@ class OpenAIProxyServer(ThreadingHTTPServer):
         self.service = service
         self.api_key = api_key
         super().__init__(addr, OpenAIHandler)
+
+    def handle_error(self, request, client_address) -> None:
+        """Routine disconnects (client reset, aborted websocket probes,
+        broken pipes) are not server errors - stay quiet instead of dumping
+        socketserver tracebacks.  Anything else still logs normally."""
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(exc_type, CONNECTION_ERRORS):
+            return
+        super().handle_error(request, client_address)
 
 
 def serve(client, *, host: str = "127.0.0.1", port: int = 8080,

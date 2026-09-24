@@ -138,7 +138,17 @@ def test_router_new_cached_native_replay():
     s = Session(id="s1", views=list(v), keys=keys_of(v))
     r.add(s)
 
-    # exact resend -> cached
+    # half-built session (stream never committed a reply) -> not cached
+    # (re-serving it would return an empty/blank reply); it is dropped
+    assert r.decide(views_of(sys_user)).mode == "new"
+    assert len(r) == 0
+
+    s = Session(id="s1", views=list(v), keys=keys_of(v))
+    s.last_assistant = {"id": "x", "choices": [{"message": {
+        "role": "assistant", "content": "hello"}, "finish_reason": "stop"}]}
+    r.add(s)
+
+    # exact resend of a *committed* session -> cached
     assert r.decide(views_of(sys_user)).mode == "cached"
     # stateless retry: incoming history is the prefix just before our reply
     s.append({"role": "assistant", "content": "hello"})
@@ -428,3 +438,67 @@ def test_map_exception_status_codes():
     assert st == 502 and obj["error"]["type"] == "upstream_error"
     st, obj = map_exception(ValueError("boom"))
     assert st == 500 and obj["error"]["type"] == "internal_error"
+
+
+# ------------------------------------------------- regressions (blank/locks)
+def test_interrupted_stream_resend_reruns_instead_of_blank():
+    """A first-message stream that dies mid-flight must not poison the router:
+    the resend used to hit the 'cached' path with an empty reply ({})."""
+    be = StubBackend(turns=[[{"type": "answer", "text": "hello there"}],
+                            [{"type": "answer", "text": "hello again"}]])
+    svc = make_service(be)
+    body = {"model": "m", "stream": True, "messages": [
+        {"role": "system", "content": "S"}, {"role": "user", "content": "hi"}]}
+    kind, gen = svc.handle_chat(dict(body), stream=True)
+    assert kind == "stream"
+    next(gen)                      # one chunk reaches the client...
+    gen.close()                    # ...then the connection dies (GeneratorExit)
+
+    # the exact resend re-runs the turn - it is NOT served a blank cache
+    kind2, payload = svc.handle_chat(dict(body), stream=False)
+    assert kind2 == "json"
+    assert payload["choices"][0]["message"]["content"] == "hello again"
+    assert len(be.stream_calls) == 2
+
+
+def test_native_continuation_keeps_full_history():
+    """Turns 2..N must stay on the same upstream chat: the router needs the
+    new user turns committed into the session (they used to be dropped, so
+    turn 3 silently fell back to replay)."""
+    be = StubBackend()
+    svc = make_service(be)
+    msgs = [{"role": "user", "content": "one"}]
+    for word in ("two", "three", "four"):
+        out = chat({"model": "m", "messages": msgs}, svc)
+        reply = out["choices"][0]["message"]["content"]
+        msgs = msgs + [{"role": "assistant", "content": reply},
+                       {"role": "user", "content": word}]
+    out = chat({"model": "m", "messages": msgs}, svc)     # 5th turn
+    assert len(be.created) == 1                            # one upstream chat
+    assert [c[2] for c in be.stream_calls] == ["one", "two", "three", "four"]
+    # stored history is a true prefix of the client's history
+    (sess,) = svc.router._sessions.values()
+    assert [v["role"] for v in sess.views] == \
+        ["user", "assistant", "user", "assistant", "user", "assistant",
+         "user", "assistant"]
+
+
+def test_stream_lock_released_when_stream_never_consumed():
+    """handle_chat(stream=True) whose iterator is dropped without a single
+    read must still release the global lock (generator-finally alone never
+    runs for a never-started generator)."""
+    be = StubBackend(turns=[[{"type": "answer", "text": "x"}]])
+    svc = make_service(be)
+    kind, gen = svc.handle_chat({"model": "m", "stream": True,
+                                 "messages": [{"role": "user",
+                                               "content": "hi"}]})
+    assert kind == "stream"
+    del gen                                   # abandoned, never iterated
+    import gc
+    gc.collect()
+    assert svc._lock.acquire(timeout=1)       # would deadlock/raise if leaked
+    svc._lock.release()
+    # the service still serves requests afterwards
+    out = chat({"model": "m", "messages": [{"role": "user", "content": "yo"}]},
+               svc)
+    assert out["choices"][0]["message"]["content"]

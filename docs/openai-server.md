@@ -120,7 +120,18 @@ tool result inside the final answer.
 ### Hygiene
 
 - One upstream turn at a time (global lock + 4 s request pacing), so the
-  proxy behaves like one careful browser session.
+  proxy behaves like one careful browser session. The lock is released
+  exactly once per streamed reply - on completion, on client disconnect or
+  on stream abandonment - so a dropped connection can never wedge the
+  server.
+- A first-message stream that dies mid-flight (client reset, timeout) never
+  poisons the conversation memory: the exact resend re-runs the turn
+  instead of being served an empty cached reply.
+- Websocket probes (`GET /ws` and any `Upgrade:` handshake) are answered
+  with a clean JSON 404 pointing at `POST /v1/chat/completions` (SSE) and
+  the connection is closed immediately - probing clients cannot leave
+  half-read keep-alive sockets that reset and spam `ConnectionResetError`
+  tracebacks. Routine disconnects are swallowed silently.
 - Expired/evicted conversations are deleted upstream (chats + project,
   best effort); Ctrl-C cleans up everything still in memory.
 - Sessions dropped after upstream failures so retries rebuild cleanly.

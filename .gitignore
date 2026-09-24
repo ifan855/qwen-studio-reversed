@@ -7,3 +7,4 @@ dist/
 .env
 qwen.auth.json
 venv/
+.venv/
