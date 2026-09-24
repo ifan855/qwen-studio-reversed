@@ -245,21 +245,32 @@ class SessionRouter:
     # ----------------------------------------------------------------- decide
     def decide(self, views: List[Dict[str, Any]]) -> Decision:
         keys = keys_of(views)
+        stale: List[Session] = []
+        result: Optional[Decision] = None
         for sid in reversed(self._order):               # most recent first
             sess = self._sessions.get(sid)
             if sess is None:
                 continue
             n = len(sess.keys)
             if keys == sess.keys:
+                if not sess.last_assistant:
+                    # Half-built session: it was registered for exactly this
+                    # history but its stream never completed (client
+                    # disconnect, upstream failure).  Never re-serve an empty
+                    # cache from it - forget it and re-run the request.
+                    stale.append(sess)
+                    continue
                 self._touch_order(sid)
                 sess.touch()
-                return Decision("cached", session=sess)
+                result = Decision("cached", session=sess)
+                break
             if len(keys) > n and keys[:n] == sess.keys:
                 tail = views[n:]
                 if all(t.get("role") in ("user", "tool") for t in tail):
                     self._touch_order(sid)
                     sess.touch()
-                    return Decision("native", session=sess, tail=tail)
+                    result = Decision("native", session=sess, tail=tail)
+                    break
                 break                                    # rewound/edited -> replay
             if len(keys) == n - 1 and keys == sess.keys[:len(keys)]:
                 # stateless retry / "continue from this exact history": the
@@ -268,7 +279,12 @@ class SessionRouter:
                         and sess.last_assistant:
                     self._touch_order(sid)
                     sess.touch()
-                    return Decision("cached", session=sess)
+                    result = Decision("cached", session=sess)
+                    break
+        for s in stale:                                   # aborted streams
+            self.drop(s)
+        if result is not None:
+            return result
         non_system = [v for v in views if v.get("role") not in ("system", "developer")]
         if len(non_system) == 1 and non_system[0].get("role") == "user":
             return Decision("new")
@@ -508,6 +524,47 @@ class Plan:
     gen: Optional[Generator[Dict[str, Any], None, None]] = None
 
 
+class _LockedStream:
+    """Chunk iterator that owns the global upstream lock for one streamed
+    reply.
+
+    Releases the lock exactly once - on exhaustion, on error, on
+    ``close()`` (client disconnect) or on garbage collection (stream never
+    started) - so an aborted request can never leave the lock held or the
+    service wedged.
+    """
+
+    def __init__(self, gen: Generator[Dict[str, Any], None, None],
+                 release: Any) -> None:
+        self._gen = gen
+        self._release = release
+        self._done = False
+
+    def __iter__(self) -> "_LockedStream":
+        return self
+
+    def __next__(self) -> Dict[str, Any]:
+        try:
+            return next(self._gen)
+        except BaseException:
+            self._finish()
+            raise
+
+    def close(self) -> None:
+        try:
+            self._gen.close()
+        finally:
+            self._finish()
+
+    def _finish(self) -> None:
+        if not self._done:
+            self._done = True
+            self._release()
+
+    def __del__(self) -> None:  # pragma: no cover - GC timing dependent
+        self._finish()
+
+
 class OpenAICompatService:
     """Serves OpenAI chat-completions payloads over a :class:`QwenBackend`."""
 
@@ -583,37 +640,28 @@ class OpenAICompatService:
     def handle_chat(self, body: Dict[str, Any], *, stream: bool = True) -> Any:
         """Serialised entry point.
 
-        ``stream=True``  -> ``("stream", generator-of-chunk-dicts)``; the lock
-        is released when the generator is fully consumed (or closed on client
-        disconnect).
+        ``stream=True``  -> ``("stream", iterator-of-chunk-dicts)``; the lock
+        is released when the stream is fully consumed, closed on client
+        disconnect, or garbage collected - exactly once, never left held.
 
         ``stream=False`` -> ``("json", one chat.completion object)``; the
-        generator is drained under the lock and aggregated.
+        stream is drained under the lock and aggregated.
         """
         self._lock.acquire()
         try:
             plan = self._plan(body)
-            if plan.mode == "cached":
-                self._lock.release()
-                return "json", plan.cached
-            gen = plan.gen
-            assert gen is not None
-
-            def guarded() -> Generator[Dict[str, Any], None, None]:
-                try:
-                    yield from gen
-                finally:
-                    self._lock.release()
-
-            if stream:
-                return "stream", guarded()
-            try:
-                return "json", aggregate_chunks(guarded())
-            except Exception:
-                raise
         except Exception:
             self._lock.release()
             raise
+        if plan.mode == "cached":
+            self._lock.release()
+            return "json", plan.cached
+        gen = plan.gen
+        assert gen is not None
+        out = _LockedStream(gen, self._lock.release)
+        if stream:
+            return "stream", out
+        return "json", aggregate_chunks(out)
 
     # ------------------------------------------------------------- planning
     def _plan(self, body: Dict[str, Any]) -> Plan:
@@ -744,6 +792,11 @@ class OpenAICompatService:
         except Exception:
             self._drop_session(sess)
             raise
+        # commit the new user/tool turns so the stored history stays a true
+        # prefix of what the client holds (routing + caching depend on it)
+        for v in tail:
+            sess.append(v)
+        sess.touch()
         return Plan(mode="native", session=sess,
                     gen=self._drive(sess, events, model, sess.views))
 
@@ -876,6 +929,16 @@ class OpenAICompatService:
                     first = False
             finish = "tool_calls" if calls else "stop"
             yield _chunk(reply_id, created, model, {}, finish_reason=finish)
+        except GeneratorExit:
+            # client disconnected mid-stream: the reply was never committed.
+            # Forget the half-built session and clean the abandoned upstream
+            # conversation so a resend re-runs instead of re-serving blank.
+            self.router.drop(sess)
+            try:
+                self.backend.cleanup(sess.chats, sess.project_id)
+            except Exception:  # noqa: BLE001 - cleanup must never raise
+                pass
+            raise
         except Exception:
             self._drop_session(sess)
             raise
