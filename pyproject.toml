@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qwen-studio"
-version = "0.4.1"
+version = "0.5.0"
 description = "Reverse-engineered, live-verified Python client for the Qwen Studio (chat.qwen.ai) web API: chats, streaming, MCP tools, browser-session import, images, system prompts."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -31,6 +31,7 @@ qwen-studio = "qwen_studio.cli:main"
 [project.optional-dependencies]
 keyring = ["secretstorage>=3.2"]   # libsecret lookup for Chrome-family 'Safe Storage' keys
 fallback = ["requests>=2.28"]      # plain-requests fallback (impersonate=None) - not recommended
+warmup = ["playwright>=1.40"]       # headless-browser warmup that mints the full anti-bot cookie jar
 dev = ["pytest>=7"]
 
 [tool.setuptools.packages.find]

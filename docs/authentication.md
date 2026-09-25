@@ -55,8 +55,9 @@ The four constructors cover every situation:
 
 | Constructor | When to use | Renewal |
 |---|---|---|
-| `from_browser(...)` | **recommended** - you are logged in to chat.qwen.ai in a local Firefox/Chrome/Chromium profile (Linux) | full; also carries the complete anti-bot cookie jar (see [browser-session.md](browser-session.md)) |
-| `from_credentials(email, pw)` | you have the account | full (auto re-sign-in) |
+| `from_browser(...)` | **recommended** on desktops — you are logged in to chat.qwen.ai in a local Firefox/Chrome/Chromium profile (Linux) | full; also carries the complete anti-bot cookie jar (see [browser-session.md](browser-session.md)) |
+| `from_credentials(email, pw, warmup=True)` | headless / server / CI — signs in and runs a headless-browser warmup that mints the complete anti-bot jar | full (auto re-sign-in, re-warmup) |
+| `from_credentials(email, pw)` | low-volume use only — the four-cookie signin jar is eventually punished on `/chat/completions` | full (auto re-sign-in) |
 | `from_session_token(token)` | you exported the cookie from a browser | auto refresh while valid |
 | `from_access_token(token)` | you hold a live 15-min token only | none — it will expire |
 
@@ -64,6 +65,57 @@ The four constructors cover every situation:
 authenticated request: if the cached access token is within its safety
 margin of expiry, it refreshes (or re-signs-in when only credentials were
 given) and then proceeds. You never schedule refreshes yourself.
+
+<a id="warmup"></a>
+## Warmup: the missing half of `from_credentials`
+
+The `/auths/signin` response returns the 30-day `token` and the WAF cookie
+`acw_tc` (and the `x-ap` routing cookie). That is enough for management
+endpoints (`/models/`, `/chats/create`, `/files/...`) but **not enough for
+`/chat/completions`** — the risk engine expects the *complete* `.qwen.ai`
+cookie jar a real browser accumulates (`cna`, `tfstk`, `isg`,
+`ssxmod_itna*`, ...). Those cookies are minted by Aliyun's edge and
+tracking infrastructure via JavaScript beacons that fire when the SPA
+boots; a pure-HTTP client (even one with a perfect Chrome TLS fingerprint)
+cannot synthesise them. See [anti-bot.md](anti-bot.md) for the controlled
+experiment that proved the jar is the deciding variable.
+
+The warmup is the fix. It launches a headless Chromium for a few seconds
+with the session token pre-injected as a cookie, lets the SPA's JS beacons
+fire, then extracts and merges the resulting jar. Two backends are
+supported:
+
+1. **Playwright** (preferred): install with `pip install qwen-studio[warmup]`
+   and run `playwright install chromium` once.
+2. **`agent-browser`** CLI (fallback): install with
+   `npm install -g agent-browser && agent-browser install`.
+
+```python
+# explicit warmup
+q = QwenStudio.from_credentials("you@example.com", "password", warmup=True)
+# force a specific backend
+q = QwenStudio.from_credentials("you@example.com", "password",
+                                warmup=True, warmup_backend="playwright")
+# or: warmup_backend="agent-browser"
+
+# runtime warmup on an existing client (e.g. after a manual signin)
+q.signin()
+q.do_warmup()
+```
+
+The CLI runs warmup automatically when it would otherwise have a thin jar
+(no local browser profile, env-var credentials supplied):
+
+```bash
+export QWEN_EMAIL=you@example.com
+export QWEN_PASSWORD=...
+qwen-studio login                # signs in, warms up, saves the full jar
+qwen-studio serve                # serves /v1/chat/completions safely
+```
+
+The warmup is also re-run automatically when `ensure_access_token()` has
+to re-sign-in (after the 30-day session expires), so long-running servers
+stay safe across month boundaries.
 
 ## Header contract
 

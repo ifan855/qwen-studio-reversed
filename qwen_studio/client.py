@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import uuid
 import warnings
@@ -50,6 +51,19 @@ from .sse import consume, StreamResult
 
 WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+#: Chrome Client-Hints that real Chrome sends on every request. curl_cffi's
+#: ``impersonate="chrome"`` handles the TLS/HTTP2 fingerprint but does NOT
+#: auto-emit these headers — the Baxia risk engine scores their absence.
+SEC_CH_UA = ('"Chromium";v="131", "Not_A Brand";v="24", '
+             '"Google Chrome";v="131"')
+SEC_CH_UA_MOBILE = "?0"
+SEC_CH_UA_PLATFORM = '"Windows"'
+
+#: Baxia SDK version header — Alibaba's anti-bot SDK on the SPA injects
+#: this on every XHR. Missing it is a strong bot signal. The version
+#: captured from the live SPA at the time of writing was 2.5.37.
+BX_V = "2.5.37"
 
 BASE = "https://chat.qwen.ai/api/v2"
 AUTH_BASE = "https://auth.qwen.ai/api/v2"
@@ -148,7 +162,11 @@ class QwenStudio:
                  auto_refresh: bool = True,
                  impersonate: Optional[str] = "chrome",
                  min_interval: float = 4.0, jitter: float = 1.5,
-                 extra_cookies: Optional[Dict[str, str]] = None) -> None:
+                 extra_cookies: Optional[Dict[str, str]] = None,
+                 warmup: bool = False,
+                 warmup_backend: str = "auto",
+                 mimic_browser: bool = True,
+                 auto_solve_captcha: bool = True) -> None:
         self.cookie_source = "explicit"
         if not (session_token or access_token or (email and password)):
             raise exc.AuthError(
@@ -168,6 +186,28 @@ class QwenStudio:
             impersonate, min_interval=min_interval, jitter=jitter)
         self._access_expires_at = 0.0
         self._bootstrapped = False
+        # warmup configuration - remembered so ensure_access_token() can
+        # re-run it after an automatic re-sign-in (see _do_warmup).
+        self._warmup_enabled = bool(warmup)
+        self._warmup_backend = warmup_backend
+        self._warmed_up = False
+        # browser-mimicry configuration: when on (default), the client fires
+        # the same /api/v2/users/status telemetry beacons and sidebar
+        # refreshes a real browser makes around each /chat/completions
+        # call. The Baxia risk engine scores request PATTERN, not just
+        # cookies - a clean "just /chats/new + /chat/completions" sequence
+        # is the strongest bot signal after cookie absence. See
+        # docs/anti-bot.md for the experiment that proved this.
+        self._mimic_browser = bool(mimic_browser)
+        self._last_sidebar_refresh = 0.0
+        self._user_uuid = None  # populated from /auths/ refresh response
+        # captcha auto-solve: when on (default), a PunishedError raised
+        # from open_stream() triggers qwen_studio.captcha.solve_punish
+        # which launches a headless browser to drag the Baxia slider
+        # and obtain the x5sec cookie. The cookie is merged into
+        # extra_cookies and the stream is retried once.
+        self._auto_solve_captcha = bool(auto_solve_captcha)
+        self._captcha_solve_attempted = False  # guard against retry loops
         self._wire_services()
 
     def _paced_sleep(self) -> None:
@@ -203,21 +243,79 @@ class QwenStudio:
 
     # ------------------------------------------------------------ constructors
     @classmethod
-    def from_credentials(cls, email: str, password: str, **kw: Any) -> "QwenStudio":
-        """Sign in with email + plaintext password (hashed in transit)."""
-        c = cls(email=email, password=password, **kw)
+    def from_credentials(cls, email: str, password: str, *,
+                         warmup: bool = True,
+                         warmup_backend: str = "auto",
+                         **kw: Any) -> "QwenStudio":
+        """Sign in with email + plaintext password (hashed in transit).
+
+        ``warmup=True`` (default since v0.5.0) launches a headless
+        browser (Playwright if installed, otherwise the ``agent-browser``
+        CLI) to let the SPA mint the complete anti-bot cookie jar
+        (``cna``, ``tfstk``, ``isg``, ``ssxmod_itna*``, ...). Without
+        the warmup, the session carries only the four cookies
+        ``/auths/signin`` itself returns (``token``, ``acw_tc``,
+        ``x-ap``, ``refresh_token``); those are enough for low-volume
+        use but the risk engine eventually punishes bare-jar traffic on
+        ``/chat/completions`` - see docs/anti-bot.md.
+
+        The warmup is now default-on because:
+        1. Playwright is a soft dependency (``pip install
+           qwen-studio[warmup]``); if it's not installed, the constructor
+           falls back to the thin-jar path with a ``RuntimeWarning``.
+        2. The browser-mimicry layer (``mimic_browser=True``) extends
+           the session's survival, but the warmup is still the right
+           default - it gives every session a browser-equivalent cookie
+           jar from the first request.
+        3. The auto-captcha-solver (``auto_solve_captcha=True``) catches
+           any punish that slips through and lifts it via the Baxia
+           slider solver, so even a thin-jar session can recover.
+        """
+        c = cls(email=email, password=password,
+                warmup=warmup, warmup_backend=warmup_backend, **kw)
         c.signin()
+        if warmup:
+            try:
+                c.do_warmup(backend=warmup_backend)
+            except Exception as e:  # noqa: BLE001 - warn, don't crash
+                import warnings as _w
+                _w.warn(
+                    f"warmup failed ({e}); the session is usable but "
+                    f"the anti-bot cookie jar may be thin - install "
+                    f"Playwright with `pip install qwen-studio[warmup] "
+                    f"&& playwright install chromium` for the full jar",
+                    RuntimeWarning, stacklevel=2)
         return c
 
     @classmethod
-    def from_session_token(cls, token: str, **kw: Any) -> "QwenStudio":
-        """Reuse a 30-day session token (e.g. exported from a browser cookie)."""
-        c = cls(session_token=token, **kw)
+    def from_session_token(cls, token: str, *,
+                          warmup: bool = True,
+                          warmup_backend: str = "auto",
+                          **kw: Any) -> "QwenStudio":
+        """Reuse a 30-day session token (e.g. exported from a browser cookie).
+
+        When ``warmup=True`` (default), runs a headless browser to mint
+        the full anti-bot jar against this token - useful when the
+        token was obtained from a non-browser source (a previous
+        ``from_credentials`` sign-in, a stored auth file, an
+        env-var-supplied token, ...).
+        """
+        c = cls(session_token=token,
+                warmup=warmup, warmup_backend=warmup_backend, **kw)
         if kw.get("auto_refresh", True):
             try:
                 c.refresh()
             except Exception:  # noqa: BLE001 - stay cookie-capable
-                pass  # bearer calls will raise on demand
+                pass
+        if warmup:
+            try:
+                c.do_warmup(backend=warmup_backend)
+            except Exception as e:  # noqa: BLE001 - warn, don't crash
+                import warnings as _w
+                _w.warn(
+                    f"warmup failed ({e}); the session is usable but may be "
+                    f"punished on /chat/completions; see docs/anti-bot.md",
+                    RuntimeWarning, stacklevel=2)
         return c
 
     @classmethod
@@ -228,7 +326,12 @@ class QwenStudio:
     @classmethod
     def from_browser(cls, browser: Optional[str] = None,
                      profile: Optional[str] = None,
-                     domain: str = "qwen.ai", **kw: Any) -> "QwenStudio":
+                     domain: str = "qwen.ai",
+                     *,
+                     fallback_to_env: bool = True,
+                     warmup: bool = False,
+                     warmup_backend: str = "auto",
+                     **kw: Any) -> "QwenStudio":
         """Build the client from a local browser profile's cookies (Linux).
 
         Reads the *complete* cookie jar - the session ``token`` plus the
@@ -247,16 +350,49 @@ class QwenStudio:
         cookie wins (see :mod:`qwen_studio.browser_cookies`).
         ``auto_refresh`` defaults on; a failed initial refresh still leaves
         the client cookie-capable.
+
+        When no local browser profile is found (headless servers,
+        containers, CI) and ``fallback_to_env=True`` (default), the
+        constructor falls back to :meth:`from_credentials` using the
+        ``QWEN_EMAIL`` / ``QWEN_PASSWORD`` environment variables, with
+        ``warmup=True`` so the missing anti-bot jar is minted via a
+        headless browser. Without the env vars set, raises
+        :class:`BrowserCookieError` as before.
         """
         from . import browser_cookies as bc
-        prof, cookies = bc.find_qwen_jar(browser, profile, domain=domain)
+        try:
+            prof, cookies = bc.find_qwen_jar(browser, profile, domain=domain)
+        except bc.BrowserCookieError:
+            if not fallback_to_env:
+                raise
+            email = os.environ.get("QWEN_EMAIL")
+            password = os.environ.get("QWEN_PASSWORD")
+            if not (email and password):
+                raise
+            # log the fallback so the user knows why they're not seeing
+            # a browser-profile cookie source
+            import warnings as _w
+            _w.warn(
+                "no local browser profile found; falling back to "
+                "QWEN_EMAIL/QWEN_PASSWORD env vars with warmup=True - "
+                "the headless browser will mint the anti-bot cookie jar "
+                "that from_browser() would normally read from disk",
+                RuntimeWarning, stacklevel=2)
+            # warmup is mandatory on the env fallback path - without it the
+            # session would carry only the four signin cookies and get
+            # punished on /chat/completions (see docs/anti-bot.md)
+            return cls.from_credentials(
+                email, password,
+                warmup=True, warmup_backend=warmup_backend, **kw)
+
         jar = {c.name: c.value for c in cookies}
         token = jar.pop("token", None)
         if not token:
             raise exc.AuthError(
                 f"no session token for {domain!r} in {prof.browser}:"
                 f"{prof.name}; log in to chat.qwen.ai in that browser first")
-        c = cls(session_token=token, extra_cookies=jar, **kw)
+        c = cls(session_token=token, extra_cookies=jar,
+                warmup=warmup, warmup_backend=warmup_backend, **kw)
         c.cookie_source = f"{prof.browser}:{prof.name} ({prof.cookie_db})"
         if kw.get("auto_refresh", True):
             try:
@@ -288,6 +424,21 @@ class QwenStudio:
             "Content-Type": "application/json",
             "Origin": "https://chat.qwen.ai",
             "Referer": "https://chat.qwen.ai/",
+            # Chrome Client-Hints — real Chrome sends these on every
+            # request; curl_cffi's chrome impersonation handles TLS/HTTP2
+            # but does NOT auto-emit Client-Hints, and the Baxia risk
+            # engine scores their absence.
+            "sec-ch-ua": SEC_CH_UA,
+            "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+            "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            # Baxia SDK version — the SPA injects this header on every XHR
+            # via its tracker SDK. Missing it is a strong "this is not the
+            # browser" signal to the risk engine.
+            "bx-v": BX_V,
             "source": self.source,
             "version": self.version,
             "timezone": js_timezone(),
@@ -310,20 +461,91 @@ class QwenStudio:
         return jar
 
     # -------------------------------------------------------------- token cycle
+    def _absorb_response_cookies(self, r: Any) -> None:
+        """Pull Set-Cookie values from a response into ``extra_cookies``.
+
+        ``curl_cffi`` stores them in the session jar, but the jar is not
+        serialised when the auth file is written - so callers that reload
+        from disk (e.g. ``qwen-studio serve``) would lose them. Merging
+        into ``extra_cookies`` makes them persistent across restarts.
+        """
+        try:
+            # curl_cffi exposes a headers.get_list / .get_all
+            if hasattr(r.headers, "get_list"):
+                lines = r.headers.get_list("Set-Cookie")
+            elif hasattr(r.headers, "get_all"):
+                lines = r.headers.get_all("Set-Cookie") or []
+            else:
+                raw = r.headers.get("set-cookie", "")
+                lines = [raw] if raw else []
+        except Exception:  # noqa: BLE001
+            lines = []
+        for ln in lines:
+            # parse 'name=value; Path=/; Domain=.qwen.ai; ...'
+            head = ln.split(";", 1)[0].strip()
+            if "=" not in head:
+                continue
+            k, v = head.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if k and k != "token":  # token is tracked separately
+                self.extra_cookies[k] = v
+
     def signin(self) -> Dict[str, Any]:
-        """Password sign-in -> 30-day session token."""
+        """Password sign-in -> 30-day session token.
+
+        Also absorbs the ``Set-Cookie`` headers from the response into
+        :attr:`extra_cookies` (``acw_tc``, ``x-ap``, ``cna`` if the edge
+        mints one here, ...). These plus the session token form the
+        *minimal* cookie jar; :meth:`do_warmup` extends it to the full
+        risk-engine set when a headless browser is available.
+        """
         if not (self.email and self._password):
             raise exc.AuthError("signin requires email and password")
         pw = hashlib.sha256(self._password.encode()).hexdigest()
-        r = self.http.post(f"{BASE}/auths/signin", json={"email": self.email, "password": pw},
-                           headers=self.headers(bearer=False), timeout=self.timeout)
+        r = self.http.post(f"{BASE}/auths/signin",
+                           json={"email": self.email, "password": pw},
+                           headers=self.headers(bearer=False),
+                           timeout=self.timeout)
         d = self._json(r)
         if not d.get("success"):
             raise exc.AuthError("signin rejected", status=r.status_code, payload=d)
         data = d.get("data") or {}
         self.session_token = data.get("token") or self.session_token
+        self._absorb_response_cookies(r)
         self._bootstrapped = True
         return data
+
+    def do_warmup(self, *, backend: str = "auto",
+                  timeout_ms: int = 30_000,
+                  force: bool = False) -> Dict[str, str]:
+        """Run a headless-browser warmup and merge the jar into the client.
+
+        Idempotent unless ``force=True``: re-runs only matter after a fresh
+        sign-in (which ``ensure_access_token`` triggers when the 30-day
+        session expires). Returns the captured cookie dict.
+
+        Raises :class:`qwen_studio.warmup.WarmupError` when no backend is
+        available or the SPA fails to boot. The caller should treat this
+        as a soft-failure (the session is still usable for low-volume work).
+        """
+        if self._warmed_up and not force:
+            return dict(self.extra_cookies)
+        if not self.session_token:
+            raise exc.AuthError(
+                "warmup requires a session token; call signin() first")
+        from .warmup import warmup_cookie_jar
+        jar = warmup_cookie_jar(self.session_token,
+                                backend=backend, timeout_ms=timeout_ms)
+        # the SPA may rotate the token (e.g. refresh-on-load); honour that
+        new_token = jar.pop("token", None)
+        if new_token and new_token != self.session_token:
+            self.session_token = new_token
+        # merge the full anti-bot jar; the curl_cffi session jar will
+        # pick these up via the explicit cookies= on each request
+        self.extra_cookies.update(jar)
+        self._warmed_up = True
+        return dict(self.extra_cookies)
 
     def refresh(self, *, force: bool = False) -> str:
         """Exchange the session cookie for a fresh 900 s access token.
@@ -352,6 +574,20 @@ class QwenStudio:
         self.refresh_token = data.get("refresh_token") or self.refresh_token
         self._access_expires_at = time.time() + 900 - 30  # 15 min minus margin
         self._bootstrapped = True
+        # capture the user UUID from the JWT for the status-beacon payload
+        # (the SPA includes it as typarm2 on every /users/status call)
+        try:
+            import base64 as _b64
+            payload_b64 = self.access_token.split(".")[1]
+            # JWT uses base64url without padding
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            jwt_payload = json.loads(_b64.urlsafe_b64decode(payload_b64))
+            self._user_uuid = jwt_payload.get("id") or self._user_uuid
+        except Exception:  # noqa: BLE001 - best-effort
+            pass
+        # refresh happens cross-host (auth.qwen.ai) - capture any Set-Cookie
+        # it returns so the persisted jar stays complete across restarts
+        self._absorb_response_cookies(r)
         return self.access_token
 
     def ensure_access_token(self) -> str:
@@ -364,6 +600,18 @@ class QwenStudio:
                 return self.access_token  # type: ignore[return-value]
             if self.email and self._password:
                 self.signin()
+                # if warmup was configured, the new session token needs a
+                # fresh anti-bot jar - the cookies from the old sign-in
+                # are no longer valid against the new session
+                if self._warmup_enabled:
+                    try:
+                        self.do_warmup(backend=self._warmup_backend, force=True)
+                    except Exception:  # noqa: BLE001 - warn, don't crash
+                        import warnings as _w
+                        _w.warn(
+                            "post-resignin warmup failed; the session is "
+                            "usable but the risk engine may punish it",
+                            RuntimeWarning, stacklevel=2)
                 self.refresh()
                 return self.access_token  # type: ignore[return-value]
         if self.access_token:
@@ -403,10 +651,21 @@ class QwenStudio:
     @staticmethod
     def _check_punish(text: str) -> None:
         if _looks_punished(text):
+            # try to extract the punish URL so the caller (or the auto-solve
+            # path in open_stream) can pass it to qwen_studio.captcha.solve_punish
+            punish_url = None
+            try:
+                import re as _re
+                m = _re.search(r'"url"\s*:\s*"([^"]+)"', text)
+                if m:
+                    punish_url = m.group(1).replace("\\/", "/").replace(":443", "")
+            except Exception:  # noqa: BLE001
+                pass
             raise exc.PunishedError(
                 "request intercepted by the anti-bot risk engine (RGV587); "
                 "stop and wait several minutes before any further call",
-                body=text[:500])
+                body=text[:500],
+                punish_url=punish_url)
 
     def _check_app_error(self, r: Any, d: Dict[str, Any]) -> None:
         if d.get("success") is True:
@@ -459,16 +718,259 @@ class QwenStudio:
                             if isinstance(m, dict)]
         return []
 
+    # ------------------------------------------------------ browser mimicry
+    #: how often (seconds) to refresh the sidebar/listing endpoints when
+    #: :attr:`_mimic_browser` is on. The real SPA polls these ~30s when
+    #: idle and immediately after each chat completes.
+    SIDEBAR_REFRESH_INTERVAL = 30.0
+
+    def _send_status_beacon(self, *, page_id: str = "//chat.qwen.ai/",
+                            kind: str = "session") -> None:
+        """Mimic the SPA's ``POST /api/v2/users/status`` telemetry beacon.
+
+        The browser fires this BEFORE and AFTER every ``/chat/completions``
+        call (and on every SPA route change). The payload shape captured
+        from the live SPA:
+
+            {"typarms": {
+                "typarm1": "web",                # source
+                "typarm2": "<user-uuid>",        # account id (post-login)
+                "typarm3": "prod",                # env
+                "typarm4": "qwen_chat",           # product
+                "typarm5": "product",             # channel
+                "typarm6": "",
+                "orgid": "tongyi",
+                "share_id": "", "project_id": "",
+                "channel_type": "", "community_type": "", "from_id": "",
+                "cdn_version": "0.3.11",
+                "page_id": "//chat.qwen.ai/c/<chat_id>",   # current route
+                "spmId": "a2ty_o01.29997180"     # marketing id
+            }}
+
+        ``kind=session`` sends the navigation/session beacon above;
+        ``kind=beacon`` sends the alternative ``sendBeacon`` form with a
+        random logId + timestamp (which the SPA fires as
+        ``navigator.sendBeacon`` onunload).
+
+        Failures are swallowed: the beacon is decorative for the risk
+        engine, not authoritative for the application.
+        """
+        if not self._mimic_browser:
+            return
+        try:
+            if kind == "beacon":
+                payload = {
+                    "typarms": {
+                        "logId": uuid.uuid4().hex,
+                        "timestamp": int(time.time() * 1000),
+                        "domain": "chat.qwen.ai",
+                        "testTag": "compareLogService",
+                        "testVersion": "5.0.0",
+                        "serviceName": "tongyiLogService",
+                        "requestType": "sendBeacon",
+                    }
+                }
+            else:
+                payload = {
+                    "typarms": {
+                        "typarm1": self.source,
+                        "typarm2": self._user_uuid or "",
+                        "typarm3": "prod",
+                        "typarm4": "qwen_chat",
+                        "typarm5": "product",
+                        "typarm6": "",
+                        "orgid": "tongyi",
+                        "share_id": "",
+                        "project_id": "",
+                        "channel_type": "",
+                        "community_type": "",
+                        "from_id": "",
+                        "cdn_version": self.version,
+                        "page_id": page_id,
+                        "spmId": "a2ty_o01.29997180",
+                    }
+                }
+            # fire-and-forget - short timeout, no error mapping
+            self.http.post(
+                f"{BASE}/users/status", json=payload,
+                headers=self.headers(bearer=bool(self.access_token)),
+                cookies=self._cookies(),
+                timeout=10.0,
+            )
+        except Exception:  # noqa: BLE001 - decorative beacon
+            pass
+
+    def _refresh_sidebar(self, *, force: bool = False) -> None:
+        """Refresh the sidebar/listing endpoints the SPA polls.
+
+        The real SPA calls these immediately after a chat completes and
+        every ~30s while idle. The risk engine scores the absence of this
+        background noise: a session that ONLY hits ``/chat/completions``
+        looks like a bot even with a perfect cookie jar.
+
+        Captured from the live SPA around each chat:
+        - ``GET /configs/``, ``/configs/setting-config``, ``/tts/config``
+          (SPA re-reads feature flags)
+        - ``GET /chats/pinned``, ``/chats/?page=1&...``, ``/library/list``,
+          ``/folders/``, ``/projects/``, ``/users/user/settings``,
+          ``/credits/pricing`` (sidebar refresh)
+        - ``POST /files/customer-service/entry`` (customer service beacon;
+          the SPA pings this on every chat to track user activity)
+
+        Throttled to ``SIDEBAR_REFRESH_INTERVAL``; pass ``force=True`` to
+        bypass the throttle (used by :meth:`open_stream` after a chat
+        completes).
+        """
+        if not self._mimic_browser:
+            return
+        now = time.time()
+        if not force and (now - self._last_sidebar_refresh
+                          < self.SIDEBAR_REFRESH_INTERVAL):
+            return
+        self._last_sidebar_refresh = now
+        # GET endpoints - the SPA polls these on every chat
+        get_paths = (
+            "/configs/",
+            "/configs/setting-config",
+            "/tts/config?omni_speakers=v1&audio_tts_speakers=v1&"
+            "omni_language=v1&audio_tts_language=v1",
+            "/chats/pinned",
+            "/chats/?page=1&exclude_project=true",
+            "/library/list?type=all",
+            "/folders/?exclude_project=true",
+            "/projects/",
+            "/users/user/settings",
+            "/credits/pricing",
+        )
+        for path in get_paths:
+            try:
+                self.http.get(
+                    f"{BASE}{path}",
+                    headers=self.headers(bearer=bool(self.access_token)),
+                    cookies=self._cookies(),
+                    timeout=10.0,
+                )
+            except Exception:  # noqa: BLE001 - decorative poll
+                pass
+        # POST /files/customer-service/entry - customer service beacon
+        try:
+            self.http.post(
+                f"{BASE}/files/customer-service/entry",
+                json={},
+                headers=self.headers(bearer=bool(self.access_token)),
+                cookies=self._cookies(),
+                timeout=10.0,
+            )
+        except Exception:  # noqa: BLE001 - decorative beacon
+            pass
+
+    def _send_aplus_beacon(self) -> None:
+        """Fire a tracking beacon at ``aplus.qwen.ai``.
+
+        The SPA fires these continuously (the Aliyun aplus tracker SDK).
+        They go to a *different* host (``aplus.qwen.ai``) but the risk
+        engine cross-references them: a session that hits qwen.ai APIs
+        without firing any aplus beacons looks like a bot. We send one
+        beacon per chat to close that gap.
+
+        Failures are swallowed: the beacon is decorative for the risk
+        engine, not authoritative for the application.
+        """
+        if not self._mimic_browser:
+            return
+        try:
+            # the simplest aplus beacon: a POST to /aes.1.1 with a tiny
+            # JSON payload. The real SPA sends a much richer payload
+            # (spmId chain, page info, etc.) but the risk engine only
+            # checks for the *presence* of aplus traffic, not its shape.
+            self.http.post(
+                "https://aplus.qwen.ai/aes.1.1",
+                json={"_p_url": "https://chat.qwen.ai/",
+                      "logtype": 2,
+                      "gmkey": "OTHER",
+                      "gokey": f"pid=chat_qwen_ai&_p_url=https%3A%2F%2Fchat.qwen.ai%2F"
+                               f"&cache=2f7c9a2&jsver=aplus.js&lver=1.13.26"
+                               f"&platformType=pc&device_model=Linux&os=Linux"
+                               f"&language=en-US&b=chrome131"
+                               f"&cna={self.extra_cookies.get('cna', '')}"
+                               f"&_t={int(time.time() * 1000)}"},
+                headers={"Content-Type": "application/json",
+                         "User-Agent": WEB_UA,
+                         "Referer": "https://chat.qwen.ai/",
+                         "Origin": "https://chat.qwen.ai"},
+                timeout=5.0,
+            )
+        except Exception:  # noqa: BLE001 - decorative beacon
+            pass
+
     # ---------------------------------------------------------------- streaming
     def open_stream(self, body: Dict[str, Any], chat_id: str) -> Iterator[str]:
         """POST /chat/completions and return the *raw* SSE line iterator.
+
+        When ``mimic_browser=True`` (default), this also fires the same
+        ``POST /api/v2/users/status`` telemetry beacon the SPA fires
+        before AND after every chat (see :meth:`_send_status_beacon`),
+        plus a sidebar refresh (see :meth:`_refresh_sidebar`). The risk
+        engine scores request PATTERN, not just cookies - a clean
+        ``/chats/new + /chat/completions`` sequence is the strongest bot
+        signal after cookie absence.
+
+        When ``auto_solve_captcha=True`` (default), a
+        :class:`PunishedError` from this call triggers
+        :func:`qwen_studio.captcha.solve_punish` which launches a
+        headless browser to drag the Baxia slider, obtains the
+        ``x5sec`` cookie, merges it into ``extra_cookies``, and retries
+        the stream exactly once. If the retry also punishes, the
+        ``PunishedError`` is re-raised.
 
         Note the extra request headers the web client uses for streams:
         ``Accept: application/json`` and ``x-accel-buffering: no`` (the latter
         disables proxy buffering so frames arrive live). Raises the same
         errors as :meth:`stream_completion` for non-SSE replies.
         """
+        try:
+            yield from self._open_stream_once(body, chat_id)
+        except exc.PunishedError as e:
+            if not self._auto_solve_captcha or self._captcha_solve_attempted:
+                raise
+            if not e.punish_url:
+                # no URL to solve - re-raise as-is
+                raise
+            # attempt the slider solve
+            self._captcha_solve_attempted = True
+            try:
+                from .captcha import solve_punish, has_solver
+                if not has_solver():
+                    import warnings as _w
+                    _w.warn(
+                        "punished but Playwright is not installed; install "
+                        "it with `pip install playwright && playwright "
+                        "install chromium` to enable the automatic slider "
+                        "solver", RuntimeWarning, stacklevel=2)
+                    raise
+                # solve the slider and merge the resulting cookies
+                new_cookies = solve_punish(e.punish_url, self._cookies())
+                self.extra_cookies.update(new_cookies)
+            except Exception as solve_err:
+                # solver failed - re-raise the original PunishedError
+                # with the solver error as context
+                import warnings as _w
+                _w.warn(
+                    f"captcha auto-solve failed: {solve_err}; the original "
+                    f"PunishedError is re-raised", RuntimeWarning,
+                    stacklevel=2)
+                raise e from solve_err
+            # retry the stream once with the new x5sec cookie
+            yield from self._open_stream_once(body, chat_id)
+            # reset the guard so future punish events can also be solved
+            self._captcha_solve_attempted = False
+
+    def _open_stream_once(self, body: Dict[str, Any],
+                          chat_id: str) -> Iterator[str]:
+        """Single attempt at POST /chat/completions. See :meth:`open_stream`."""
         self.ensure_access_token()
+        # browser fires users/status beacon before every chat
+        self._send_status_beacon(page_id=f"//chat.qwen.ai/c/{chat_id}")
         self._paced_sleep()
         r = self.http.post(
             f"{BASE}/chat/completions", params={"chat_id": chat_id},
@@ -487,7 +989,15 @@ class QwenStudio:
                 self._check_app_error(r, d)
             raise exc.StreamInterruptedError(
                 f"expected SSE, got content-type={ct!r} status={r.status_code}")
-        return iter_lines_compat(r)
+        # stream the SSE response
+        for line in iter_lines_compat(r):
+            yield line
+        # browser fires users/status beacon + sidebar refresh AFTER the chat
+        self._send_status_beacon(page_id=f"//chat.qwen.ai/c/{chat_id}",
+                                 kind="beacon")
+        self._refresh_sidebar(force=True)
+        # fire the aplus.qwen.ai tracking beacon the SPA fires after each chat
+        self._send_aplus_beacon()
 
     def stream_events(self, body: Dict[str, Any], chat_id: str) -> Iterator["ChatEvent"]:
         """Incremental variant of :meth:`stream_completion`: yields parsed

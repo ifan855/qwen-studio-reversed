@@ -24,8 +24,14 @@ from .openai_api import (OpenAICompatService, QwenBackend, SessionRouter,
 from . import browser_cookies, exceptions
 from .browser_cookies import (BrowserCookie, BrowserCookieError,
                               load_browser_cookies, qwen_cookie_dict)
+from . import warmup
+from .warmup import (WarmupError, warmup_cookie_jar,
+                     has_playwright, has_agent_browser)
+from . import captcha
+from .captcha import (CaptchaSolverError, solve_punish, has_solver,
+                      extract_punish_url)
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
     "QwenStudio",
@@ -39,6 +45,10 @@ __all__ = [
     "view_message", "render_history_document",
     "browser_cookies", "BrowserCookie", "BrowserCookieError",
     "load_browser_cookies", "qwen_cookie_dict",
+    "warmup", "WarmupError", "warmup_cookie_jar",
+    "has_playwright", "has_agent_browser",
+    "captcha", "CaptchaSolverError", "solve_punish",
+    "has_solver", "extract_punish_url",
     "exceptions",
     "__version__",
 ]

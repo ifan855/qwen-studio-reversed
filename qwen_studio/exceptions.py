@@ -112,11 +112,19 @@ class PunishedError(QwenStudioError):
     ``_____tmd_____/punish`` URLs. This is an anti-abuse control, not an
     application error. The correct reaction is to stop, wait a long time
     (minutes), and reduce request volume - repeated retries deepen the block.
+
+    When ``auto_solve_captcha=True`` is set on the client, the punish URL
+    is extracted from ``body`` and passed to
+    :func:`qwen_studio.captcha.solve_punish` which launches a headless
+    browser to drag the Baxia slider and obtain the ``x5sec`` cookie.
     """
 
-    def __init__(self, message: str, *, body: str = "") -> None:
+    def __init__(self, message: str, *, body: str = "",
+                 punish_url: Optional[str] = None) -> None:
         super().__init__(message)
         self.body = body
+        # the punish URL extracted from body (or None if not a punish response)
+        self.punish_url = punish_url
 
 
 class ContinuationBlockedError(PunishedError):

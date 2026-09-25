@@ -8,15 +8,22 @@ Built from a black-box protocol study of the web client (v0.3.11): every
 endpoint, header and message shape here was captured from the official
 client, replicated externally, and verified against the live service.
 
-## Quick start: the CLI (v0.4.0)
+## Quick start: the CLI (v0.5.0)
 
 ```bash
 pip install .
+pip install ".[warmup]"     # optional: enables the headless-browser warmup
+playwright install chromium # one-time browser install for the warmup
 
-# one command: pull the Qwen cookies from your browser into ./qwen.auth.json
-qwen-studio login
+# Path A: pull the complete cookie jar from your local browser
+qwen-studio login          # writes ./qwen.auth.json (cookies + token)
 
-# another command: serve a full OpenAI-compatible API wrapping Qwen Studio
+# Path B: env-var credentials + warmup (headless servers / CI / no browser)
+export QWEN_EMAIL=you@example.com
+export QWEN_PASSWORD=...
+qwen-studio login          # signs in, runs warmup, writes ./qwen.auth.json
+
+# then serve a self-hosted OpenAI-compatible API wrapping Qwen Studio
 qwen-studio serve --port 8080 --api-key sk-my-secret
 #   system prompts (server-side enforced), tools via the MCP wrap,
 #   image/file uploads, 1-hour in-memory conversation history: follow-ups
@@ -50,20 +57,36 @@ Every other constructor (`from_credentials`, `from_session_token`,
 
 ## Features
 
-- **CLI + OpenAI-compatible proxy (v0.4.0)** — `qwen-studio login` (browser
-  cookies → auth file in the current directory) and `qwen-studio serve`
-  (`/v1/chat/completions` streaming + non-streaming, `/v1/models`,
-  `/v1/files`; system prompts via the project mechanism, OpenAI `tools`
-  through the MCP wrap, image/file content parts, 1-hour in-memory
-  conversation history - continuations (incl. tool results) stay in the same
-  Qwen project + chat, with lenient matching, forks, revival of dead chats
-  and engineered replay of unseen histories; one-shot conversations are
-  deleted upstream; see [docs/openai-server.md](docs/openai-server.md))
+- **CLI + OpenAI-compatible proxy (v0.5.0)** — `qwen-studio login` (browser
+  cookies → auth file in the current directory; or env-var credentials
+  + headless-browser warmup when no browser profile exists) and
+  `qwen-studio serve` (`/v1/chat/completions` streaming + non-streaming,
+  `/v1/models`, `/v1/files`; system prompts via the project mechanism,
+  OpenAI `tools` through the MCP wrap, image/file content parts, 1-hour
+  in-memory conversation history - continuations (incl. tool results)
+  stay in the same Qwen project + chat, with lenient matching, forks,
+  revival of dead chats and engineered replay of unseen histories; one-shot
+  conversations are deleted upstream; see
+  [docs/openai-server.md](docs/openai-server.md))
 - **Browser session import (v0.2.0)** — pull the complete cookie jar
   (session token + anti-bot set) directly from Firefox, Chrome, Chromium,
   Brave or Edge profiles on Linux, incl. snap/flatpak paths, locked-DB
   safety and v10/v11 cookie decryption (`q = QwenStudio.from_browser()`;
   see [docs/browser-session.md](docs/browser-session.md))
+- **Headless-browser warmup (v0.5.0)** — when no local browser profile
+  exists (headless servers / CI / containers) and the caller authenticates
+  with `QWEN_EMAIL` + `QWEN_PASSWORD`, the library runs a short
+  headless-browser session (Playwright or the `agent-browser` CLI) that
+  loads the SPA with the session token pre-injected, lets Aliyun's JS
+  beacons mint the anti-bot cookies (`cna`, `tfstk`, `isg`,
+  `ssxmod_itna*`, ...), and merges the resulting jar into the client.
+  This is the fix for the "thin-jar" failure mode that the original
+  `from_credentials()` path produces — without the warmup, the session
+  carries only the four cookies `/auths/signin` itself returns
+  (`token`, `acw_tc`, `x-ap`, `refresh_token`) and gets punished on
+  `/chat/completions` after a while. See
+  [docs/anti-bot.md](docs/anti-bot.md) and
+  [docs/authentication.md](docs/authentication.md#warmup).
 
 - **Chat lifecycle** — create, list, read, delete, batch-delete, pin,
   archive, rename (`q.chats`)
@@ -98,6 +121,10 @@ pip install .
 # (cookie decryption) are core dependencies
 
 pip install ".[keyring]"    # + libsecret lookup for Chrome-family cookie keys
+pip install ".[warmup]"     # + Playwright for the headless-browser warmup
+                            #   (run `playwright install chromium` once)
+                            #   - needed when no local browser profile exists
+                            #   - alternative: install agent-browser CLI
 pip install ".[fallback]"   # + plain requests fallback (impersonate=None) - not recommended
 ```
 

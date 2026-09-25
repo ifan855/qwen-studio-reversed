@@ -101,7 +101,10 @@ the same flat dict.
   `~/.config/BraveSoftware/Brave-Browser`, `~/.config/microsoft-edge` and
   their snap/flatpak equivalents. A non-standard `--user-data-dir` (or a
   Windows/macOS machine) is not supported; fall back to
-  `from_session_token` or a Playwright state export.
+  `from_session_token` or a Playwright state export. On headless servers,
+  set `QWEN_EMAIL` + `QWEN_PASSWORD` and `from_browser()` will
+  automatically fall back to `from_credentials(..., warmup=True)` (see
+  [authentication.md#warmup](authentication.md#warmup)).
 - **"could not be decrypted (keyring locked or empty)"** - the browser
   stores its cookie key in your desktop keyring. Unlock it, or install
   the `keyring` extra (`pip install ".[keyring]"`) so libsecret lookup
